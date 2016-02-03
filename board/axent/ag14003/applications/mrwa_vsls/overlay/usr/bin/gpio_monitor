@@ -1,0 +1,17 @@
+#!/bin/sh
+mains=`cat /sys/class/gpio/gpio247/value`
+
+while true
+do
+  new_mains=`cat /sys/class/gpio/gpio247/value`
+
+  if [ $new_mains != $mains ]
+  then
+    wget http://localhost:42000 --header="Content-Type: application/json" --header="Accept: application/json" --post-data='{"jsonrpc": "2.0", "method": "alarm.system_check", "id": 1}' -s
+    mains=$new_mains
+  fi
+
+  sleep 1
+done
+
+exit 0 

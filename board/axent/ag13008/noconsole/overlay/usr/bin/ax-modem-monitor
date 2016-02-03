@@ -1,0 +1,27 @@
+#!/bin/sh
+ifname=$1
+
+pid=`pidof ax_modem_monitor`
+logger -p daemon.info -t modem_monitor[$pid] "$ifname monitoring started"
+echo $pid > /var/run/ax_modem_monitor.$ifname.pid 2>/dev/null
+
+sleep 10
+
+if [ "`ifconfig $ifname 2>/dev/null`" == "" ]
+then
+    logger -p daemon.info -t modem_monitor[$pid] "$ifname not found"
+
+else
+
+    while [ 1 ]
+    do
+        if [ "`ifconfig $ifname 2>/dev/null`" != "" ] && [ "`ifconfig $ifname 2>/dev/null | grep 'RUNNING'`" == "" ] ;
+        then
+            logger -p daemon.notice -t modem_monitor[$pid] "reactivating 3g service"
+            nmcli con up 3g > /dev/null
+        fi
+
+        sleep 5
+    done
+
+fi

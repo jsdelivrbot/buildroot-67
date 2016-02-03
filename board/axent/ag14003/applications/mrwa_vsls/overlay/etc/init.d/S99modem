@@ -1,0 +1,5 @@
+#!/bin/sh
+#
+# Startup script for modem.
+
+/usr/share/modem_monitor.sh &

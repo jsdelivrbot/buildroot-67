@@ -1,0 +1,47 @@
+#!/usr/bin/python
+import socket, os, sqlite3, time
+
+config_con = sqlite3.connect('/usr/share/db/config.db')
+config_con.row_factory = sqlite3.Row
+
+configs = dict(config_con.execute(
+    'select parameter, value from system').fetchall())
+
+# Get parameters from the main database.
+try:
+    port = int(configs['rtaPort']) + 1
+except:
+    port = 43001
+
+# Set up TCP server.
+feed_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+feed_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+feed_socket.bind(('', port))
+feed_socket.listen(1)
+
+logfile = open('/tmp/rta_log', 'r')
+stat_results = os.stat('/tmp/rta_log')
+stat_size = stat_results[6]
+logfile.seek(stat_size)
+
+while 1:
+    try:
+        con, addr = feed_socket.accept()
+    except:
+        time.sleep(1)
+    else:
+        while 1:
+            location = logfile.tell()
+            line = logfile.readline()
+            if not line:
+                stat_results = os.stat('/tmp/rta_log')
+                stat_size = stat_results[6]
+                if location != stat_size:
+                    logfile = open('/tmp/rta_log', 'r')
+                    logfile.seek(0)
+                time.sleep(1)
+            else:
+                try:
+                    con.send(line)
+                except:
+                    break

@@ -1,0 +1,365 @@
+#!/usr/bin/python
+import time, sqlite3, smbus, datetime, jsonrpclib, math, subprocess, sys
+from evdev import InputDevice
+
+config_db = '/usr/share/db/config.db'
+status_db = '/tmp/status.db'
+status_db_template = '/usr/share/ax-utils/status_template'
+log_db = '/usr/share/db/log.db'
+rta_log_db = '/usr/share/db/rta_log.db'
+
+server = jsonrpclib.Server('http://127.0.0.1:42000')
+
+error_code = {
+    'loadAverage': 0x01,
+    'temperature': 0x02,
+    'batteryLow': 0x03,
+    'batteryCritical': 0x04,
+    'mainsFailed': 0x05,
+    'signCommsTimeout': 0x06,
+    'masterCommsTimeout': 0x07,
+    'signTilt': 0x08,
+    'solarSystem': 0x09,
+    'displayDriverFailure': 0x0A,
+    'displaySingleLEDFailure': 0x0B,
+    'displayMultiLEDFailure': 0x0C,
+    'annulusLEDFailure': 0x0D
+    }
+
+try:
+    with sqlite3.connect(status_db) as db:
+        db.execute('select * from status').fetchall()
+except:
+    with sqlite3.connect(status_db) as db:
+        # Get the configuration template file.
+        with open(status_db_template, 'r') as template_file:
+            template = template_file.read()
+        # Generate config.db from config_template file.
+        db.executescript(template)
+
+try:
+    with sqlite3.connect(config_db) as db:
+        sign_id = int(db.execute('select value from system where \
+                              parameter="signID"').fetchone()[0])
+        interval = int(db.execute('select value from system where \
+                               parameter="statusCheckInterval"').fetchone()[0])
+        log_interval = int(db.execute('select value from system where \
+                               parameter="statusLogInterval"').fetchone()[0])
+except:
+    sign_id = 1
+    interval = 10
+    log_interval = 300
+
+try:
+    with sqlite3.connect(config_db) as db:
+        alarm_list = db.execute('select parameter, reported \
+                                 from alarm').fetchall()
+        sign_list = db.execute('select sign_id from signs').fetchall()
+
+    with sqlite3.connect(status_db) as db:
+        db.execute('delete from alarms')
+        for sign in sign_list:
+            for alarm in alarm_list:
+                if error_code.has_key(str(alarm[0])):
+                    alarm_code = error_code[str(alarm[0])]
+                else:
+                    alarm_code = 0xFF
+                db.execute('insert into alarms (sign_id, parameter, active) \
+                    values (?, ?, ?)', (sign[0], alarm_code, str(alarm[1])))
+
+    if sign_id == 1:
+        with sqlite3.connect(rta_log_db) as db:
+            fault_list = db.execute('select signID, errorCode \
+                                     from open_fault_log').fetchall()
+
+            with sqlite3.connect(status_db) as db:
+                for fault in fault_list:
+                    db.execute('update alarms set active="yes" where \
+                                sign_id=? and error_code=?', 
+                                (str(fault[0]), str(fault[1]),))
+
+except:
+    pass
+
+try:
+    with sqlite3.connect(log_db) as db:
+        result = str(db.execute('select date from status_log \
+                                 where sign_id=%s order by date \
+                                 DESC limit 1' % sign_id).fetchone()[0])
+
+    last_log = datetime.datetime.now().strptime(result, '%Y-%m-%d %H:%M:%S.%f')
+
+except:
+    last_log = datetime.datetime(2000, 1, 1)
+
+power_items = {
+    'dc_voltage': '/sys/class/hwmon/hwmon1/in1_input',
+    'dc_current': '/sys/class/hwmon/hwmon1/curr1_input',
+    'dc_power': '/sys/class/hwmon/hwmon1/power1_input',
+    'solar_voltage': '/sys/class/hwmon/hwmon2/in1_input',
+    'solar_current': '/sys/class/hwmon/hwmon2/curr1_input',
+    'solar_power': '/sys/class/hwmon/hwmon2/power1_input',
+    'battery_voltage': '/sys/class/hwmon/hwmon3/in1_input',
+    'battery_current': '/sys/class/hwmon/hwmon3/curr1_input',
+    'battery_power': '/sys/class/hwmon/hwmon3/power1_input',
+}
+
+led_items = {
+    'matrix_open': '/sys/bus/platform/devices/4aa80000.axent_ledmon/open_errors',
+    'matrix_short': '/sys/bus/platform/devices/4aa80000.axent_ledmon/short_errors',
+    'matrix_visible': '/sys/bus/platform/devices/4aa80000.axent_ledmon/visible_errors',
+    'annulus_open': '/sys/bus/platform/devices/4aab0000.axent_ledmon/open_errors',
+    'annulus_short': '/sys/bus/platform/devices/4aab0000.axent_ledmon/short_errors',
+    'annulus_visible': '/sys/bus/platform/devices/4aab0000.axent_ledmon/visible_errors',
+}
+
+def get_config(parameter):
+    with sqlite3.connect(config_db) as db:
+        result = db.execute('select value from system where \
+                             parameter="%s"' % str(parameter)).fetchone()[0]   
+
+    return result
+
+def get_display():
+    with sqlite3.connect(config_db) as db:
+        result = db.execute('select brightness, \
+                                    brightnessMode, \
+                                    testMode \
+                                    from display').fetchall()[0]        
+
+    values = {
+        'brightness': int(result[0]),
+        'brightness_mode': str(result[1]),
+        'test_mode': int(result[2])
+    }
+    return values
+
+def get_player():
+    try:
+        result = server.player.status()
+    except:
+        pass
+
+    return result
+
+def get_power_item(item):
+    if power_items.has_key(item):
+        with open(power_items[item], 'r') as itemfile:
+            if str(item).find('power') == -1:
+                item_value = int(itemfile.read()) / 1000.0
+            else:
+                item_value = int(itemfile.read()) / 1000000.0
+        
+        return item_value
+
+def get_mains():
+    with open('/sys/class/gpio/gpio247/value', 'r') as mainsfile:
+        if int(mainsfile.read()) == 1:
+            return 0 # 'ok'
+        else:
+            return 1 # 'failed'
+
+def get_tilt():
+    try:
+        dev = InputDevice('/dev/input/event0')
+        cap = dev.capabilities()
+        axis_x = cap[3][0][1][0]
+        axis_y = cap[3][1][1][0]
+        axis_z = cap[3][2][1][0]
+
+        if abs(16384-math.sqrt(axis_x**2 + axis_y**2 + axis_z**2)) > 800:
+            raise Exception('Too much acceleration for accurate tilt reading')
+
+        return math.degrees(
+            math.atan2(math.sqrt(axis_y**2 + axis_z**2), abs(axis_x)))
+    except:
+        return 0
+
+def get_led_item(item):
+    if led_items.has_key(item):
+        with open(led_items[item], 'r') as itemfile:
+            item_value = int(itemfile.read())
+
+        if str(item).find('annulu_open') != -1: # Annulus value
+            item_value -= 72
+        if str(item).find('matrix_open') != -1: # Matrix value
+            item_value -= 120
+
+        return item_value
+
+def get_led_driver(item):
+    result = {}
+    
+    if item == 'matrix':
+        files = [
+            '/sys/bus/platform/devices/4aa80000.axent_ledmon/clk_err',
+            '/sys/bus/platform/devices/4aa80000.axent_ledmon/lat_err',
+            '/sys/bus/platform/devices/4aa80000.axent_ledmon/oe_err'
+        ]
+    else:
+        files = [
+            '/sys/bus/platform/devices/4aab0000.axent_ledmon/clk_err',
+            '/sys/bus/platform/devices/4aab0000.axent_ledmon/lat_err',
+            '/sys/bus/platform/devices/4aab0000.axent_ledmon/oe_err'
+        ]
+    
+    result = 0
+    for i in range(len(files)):
+        with open(files[i], 'r') as fault_file:
+            if int(fault_file.read()) == 1:
+                result += (1 << i)
+
+    return result
+
+def get_app_version():
+    with open('/usr/share/ax-utils/version', 'r') as version_file:
+        version = str(version_file.read()).strip()
+
+    return version
+
+def get_platform_version():
+    platform_info = {}
+    with open('/etc/os-release', 'r') as platform_version_file:
+        for i in platform_version_file.readlines():
+            try:
+                key, value = i.split('=')
+            except:
+                pass
+            
+            platform_info[key.strip()] = value.strip()
+    
+    if 'VERSION' in platform_info:
+        return platform_info['VERSION'].split('.')[0]
+    else:
+        return ''
+
+# Return the temperature in degrees Celsius from the on-board temperature
+# sensor.
+def get_temperature():
+    with open('/sys/class/hwmon/hwmon0/device/temp1_input', 'r') as temp:
+            temperature = int(temp.read()) / 1000.0
+
+    return temperature
+
+# Return the relative humidity in percent from the on-board temperature
+# sensor.
+def get_humidity():
+    with open('/sys/class/hwmon/hwmon0/device/humidity1_input', 'r') as hum:
+            humidity = int(hum.read()) / 1000.0
+
+    return humidity
+
+# Return the LDR readings.
+def get_ldr():
+    with open(
+        '/sys/bus/iio/devices/iio:device0/in_voltage4_raw',
+        'r') as ldr:
+        ldr0 = int(((4095 - int(ldr.read())) / 4095.0) * 100.0)
+    
+    with open(
+        '/sys/bus/iio/devices/iio:device0/in_voltage5_raw',
+        'r') as ldr:
+        ldr1 = int(((4095 - int(ldr.read())) / 4095.0) * 100.0)
+    
+    return [ldr0, ldr1]
+
+# Return the current system time.
+def get_system_time():
+    return datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+# Return the current system uptime.
+def get_uptime():
+    with open('/proc/uptime', 'r') as uptime_file:
+        uptime_string = uptime_file.read()
+    
+    return int(float(uptime_string.split(' ')[0]))
+
+# Return load averages.
+def get_load_averages():
+    with open('/proc/loadavg', 'r') as loadavg_file:
+        loadavg_string = loadavg_file.read()
+    
+    return [float(i) for i in loadavg_string.split(' ')[:3]]
+
+while True:
+    try:
+        try:
+            display_info = get_display()
+        except:
+            pass
+
+        try:
+            player_info = get_player()
+        except:
+            pass
+
+        data = {
+            'sign_id': int(sign_id),
+            'system_time': get_system_time(),
+            'temperature': str(get_temperature()),
+            'humidity': str(get_humidity()),
+            'uptime': get_uptime(),
+            'platform_version': get_platform_version(),
+            'application_version': get_app_version(),
+            'load_averages': str(get_load_averages()),
+            'ldr': str(get_ldr()),
+            'enabled': str(get_config('signEnabled')),
+            'battery_voltage': get_power_item('battery_voltage'),
+            'battery_current': get_power_item('battery_current'),
+            'battery_power': get_power_item('battery_power'),
+            'solar_voltage': get_power_item('solar_voltage'),
+            'solar_current': get_power_item('solar_current'),
+            'solar_power': get_power_item('solar_power'),
+            'dc_voltage': get_power_item('dc_voltage'),
+            'dc_current': get_power_item('dc_current'),
+            'dc_power': get_power_item('dc_power'),
+            'mains_status': get_mains(),
+            'brightness': display_info['brightness'],
+            'brightness_mode': display_info['brightness_mode'],
+            'test_mode': display_info['test_mode'],
+            'running': player_info['running'],
+            'document': player_info['document'],
+            'annulus_open': get_led_item('annulus_open'),
+            'annulus_short': get_led_item('annulus_short'),
+            'annulus_visible': get_led_item('annulus_visible'),
+            'annulus_driver': get_led_driver('annulus'),
+            'matrix_open': get_led_item('matrix_open'),
+            'matrix_short': get_led_item('matrix_short'),
+            'matrix_visible': get_led_item('matrix_visible'),
+            'matrix_driver': get_led_driver('matrix'),
+            'tilt': get_tilt(),
+            'date': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
+        }
+      
+        print "Updating status"
+        # Update sign status
+        with sqlite3.connect(status_db) as db:
+            columns = ', '.join(data.keys())
+            placeholders = ', '.join('?' * len(data))
+            sql = 'insert or replace into status'
+            sql += '({}) values ({})'.format(columns, placeholders)
+            db.execute(sql, data.values())
+        
+        if (datetime.datetime.now()-last_log).total_seconds() >= log_interval:
+            last_log = datetime.datetime.now()
+            print "logging status"
+            # Log sign status
+
+            with sqlite3.connect(status_db) as db:
+                db.row_factory = sqlite3.Row
+                result = db.execute('select * from status').fetchall()
+            
+            if result is not None:    
+                with sqlite3.connect(log_db) as db:     
+                    for item in result:
+                        data = dict(item)
+                        columns = ', '.join(data.keys())
+                        placeholders = ', '.join('?' * len(data))
+                        sql = 'insert into status_log'
+                        sql += '({}) values ({})'.format(columns, placeholders)
+                        db.execute(sql, data.values())
+
+    except:
+        print >> sys.stderr, 'Unexpected exception in status heartbeat'
+
+    time.sleep(interval)

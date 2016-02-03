@@ -1,0 +1,7 @@
+config BR2_PACKAGE_JSONRPCLIB
+	bool "jsonrpclib"
+	help
+	  JSONRPCLIB is a python library which implements the
+	  JSON-RPC protocol.
+
+	  http://github.com/joshmarshall/jsonrpclib

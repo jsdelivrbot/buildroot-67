@@ -1,0 +1,46 @@
+# See package/makedevs/README for details
+#
+# This device table is used to assign proper ownership and permissions
+# on various files. It doesn't create any device file, as it is used
+# in both static device configurations (where /dev/ is static) and in
+# dynamic configurations (where devtmpfs, mdev or udev are used).
+#
+# <name>				<type>	<mode>	<uid>	<gid>	<major>	<minor>	<start>	<inc>	<count>
+/dev					d	755	0	0	-	-	-	-	-
+/tmp					d	1777	0	0	-	-	-	-	-
+/etc					d	755	0	0	-	-	-	-	-
+/root					d	700	0	0	-	-	-	-	-
+/home/firmware			d	755	1000	1000	-	-	-	-	-
+/var/www				d	755	33	33	-	-	-	-	-
+/etc/shadow				f	600	0	0	-	-	-	-	-
+/etc/passwd				f	644	0	0	-	-	-	-	-
+/dev/mtdblock3			b	666	0	0	-	-	-	-	-
+/dev/mtdblock4			b	666	0	0	-	-	-	-	-
+/etc/network/if-up.d			d	755	0	0	-	-	-	-	-
+/etc/network/if-pre-up.d		d	755	0	0	-	-	-	-	-
+/etc/network/if-post-up.d		d	755	0	0	-	-	-	-	-
+/etc/network/if-down.d			d	755	0	0	-	-	-	-	-
+/etc/network/if-pre-down.d		d	755	0	0	-	-	-	-	-
+/etc/network/if-post-down.d		d	755	0	0	-	-	-	-	-
+# uncomment this to allow starting x as non-root
+#/usr/X11R6/bin/Xfbdev		     	f	4755	0	0	-	-	-	-	-
+/var/www/data					d	755	0	0	-	-	-	-	-
+/etc/ssh_host_rsa_key			f	600	0	0	-	-	-	-	-
+/etc/ssh_host_rsa_key.pub		f	600	0	0	-	-	-	-	-
+/etc/init.d/S49ntp				f	755	0	0	-	-	-	-	-
+/etc/init.d/S50gpsd				f	755	0	0	-	-	-	-	-
+/etc/init.d/S60crond			f	755	0	0	-	-	-	-	-
+/etc/init.d/S99mrwavsls			f	755	0	0	-	-	-	-	-
+/etc/init.d/S99modem			f	755	0	0	-	-	-	-	-
+/usr/bin/ax-server				f	755	0	0	-	-	-	-	-
+/usr/bin/ax-display-heartbeat	f	755	0	0	-	-	-	-	-
+/usr/bin/ax-ledmon-heartbeat	f	755	0	0	-	-	-	-	-
+/usr/bin/ax-status-heartbeat	f	755	0	0	-	-	-	-	-
+/usr/bin/gpio_monitor			f	755	0	0	-	-	-	-	-
+/usr/bin/sign-comms-monitor		f	755	0	0	-	-	-	-	-
+/usr/bin/rta_commsd				f	755	0	0	-	-	-	-	-
+/usr/bin/rta_feed				f	755	0	0	-	-	-	-	-
+/usr/share/directip.sh			f   755 0   0   -   -   -   -   -
+/usr/share/gprs_monitor.sh		f   755 0   0   -   -   -   -   -
+/usr/share/modem_monitor.sh		f   755 0   0   -   -   -   -   -
+/usr/share/setup_chat.sh		f   755 0   0   -   -   -   -   -

@@ -1,0 +1,14 @@
+diff --git a/jsonrpclib/SimpleJSONRPCServer.py b/jsonrpclib/SimpleJSONRPCServer.py
+index d76da73..dafa25a 100644
+--- a/jsonrpclib/SimpleJSONRPCServer.py
++++ b/jsonrpclib/SimpleJSONRPCServer.py
+@@ -180,6 +180,9 @@ class SimpleJSONRPCRequestHandler(
+         self.wfile.write(response)
+         self.wfile.flush()
+         self.connection.shutdown(1)
++    
++    def log_message(self, format, *args):
++        pass
+ 
+ class SimpleJSONRPCServer(SocketServer.TCPServer, SimpleJSONRPCDispatcher):
+ 

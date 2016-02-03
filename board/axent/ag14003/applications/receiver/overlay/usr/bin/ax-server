@@ -1,0 +1,110 @@
+#!/usr/bin/python
+#
+
+from SocketServer import ThreadingMixIn
+from jsonrpclib.SimpleJSONRPCServer import SimpleJSONRPCServer
+from multiprocessing import Process
+import axdisplay
+import argparse
+import sqlite3
+
+config_path = ''
+display_name = ''
+fb_name = ''
+
+def get_config_db():
+    db = sqlite3.connect(config_path)
+    db.row_factory = sqlite3.Row
+    return db
+    
+# JSON functions.
+def get_ldrs():
+    with open('/sys/bus/iio/devices/iio:device0/in_voltage4_raw', 'r') \
+    as ldrfile:
+        ldr_0 = int(ldrfile.read())
+    
+    with open('/sys/bus/iio/devices/iio:device0/in_voltage5_raw', 'r') \
+    as ldrfile:
+        ldr_1 = int(ldrfile.read())
+    
+    ldr_list = []
+    
+    if(ldr_0 > 0 and ldr_0 < 4095):
+        ldr_list.append(int(((4095 - ldr_0) / 4095.0) * 100.00))
+
+    if(ldr_1 > 0 and ldr_1 < 4095):
+        ldr_list.append(int(((4095 - ldr_1) / 4095.0) * 100.00))
+    
+    return ldr_list
+        
+def get_brightness():
+    with get_config_db() as db:
+        brightness = \
+            int(db.execute('select brightness from display').fetchone()[0])
+    
+    return brightness
+
+def set_brightness(brightness):
+    with get_config_db() as db:
+        axdisplay.set_brightness(
+            display_name, fb_name, db, int(brightness))
+        db.execute('update display set brightness=?', (brightness,))
+
+class AXServer(ThreadingMixIn, SimpleJSONRPCServer):
+    def __init__(self, port):
+        # Initialise the actual JSON-RPC server.
+        SimpleJSONRPCServer.__init__(self, ('', port))
+    
+        self.register_function(get_ldrs)
+        self.register_function(get_brightness)
+        self.register_function(set_brightness)
+
+# If this is called as a script.
+if __name__ == '__main__':
+    # Read command-line arguments.
+    parser = argparse.ArgumentParser(
+        description='JSON-RPC server for configuration and management of' \
+                  + ' Axent products.')
+    parser.add_argument('-c', '--config', default='/usr/share/db/config.db',
+                        help='path to configuration database')
+    parser.add_argument('-j', '--json-port', type=int, default=42000,
+                        help='port on which the JSON server should run')
+    parser.add_argument('-v', '--verbose', action='store_true',
+                        help='print lots of stuff to stdout')
+    
+    args = parser.parse_args()
+    
+    try:
+        assert (args.json_port >= 1024) and (args.json_port <= 49151)
+    except AssertionError:
+        print >> sys.stderr, 'error: invalid json port specified'
+    
+    # Create the JSON-RPC server with parameters set by arguments.
+    json_server = AXServer(args.json_port)
+    
+    config_path = args.config
+    with get_config_db() as db:
+        display_name = \
+            str(db.execute('select deviceName from display').fetchone()[0])
+    
+    fb_name = axdisplay.get_fb_name(display_name)
+    
+    # Finally, start the server.
+    if args.verbose:
+        print 'Starting JSON server on port %d...' % args.json_port
+    json_process = Process(target=json_server.serve_forever)
+    json_process.daemon = True
+    json_process.start()
+    
+    # TODO: Monitor threads here?
+    while 1:
+        json_process.join()
+        
+        # Oops! The JSON server crashed, and we should restart it.
+        if args.verbose:
+            print 'Restarting JSON server on port %d...' % args.json_port
+        json_server.logger.info('Restarted JSON-RPC server due to crash')
+        
+        json_process = Process(target=json_server.serve_forever)
+        json_process.daemon = True
+        json_process.start()

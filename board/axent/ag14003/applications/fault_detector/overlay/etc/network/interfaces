@@ -1,0 +1,25 @@
+# Configure Loopback
+auto lo
+iface lo inet loopback
+
+auto br0
+iface br0 inet static
+	pre-up brctl addbr br0
+	address 192.168.0.12
+	netmask 255.255.255.0
+	gateway 192.168.0.1
+	post-down brctl delbr br0
+
+auto eth0
+iface eth0 inet manual
+	up ip link set eth0 up
+	up brctl addif br0 eth0
+	down brctl delif br0 eth0 || true
+	down ip link set eth0 down
+
+auto eth1
+iface eth1 inet manual
+	up ip link set eth1 up
+	up brctl addif br0 eth1
+	down brctl delif br0 eth1 || true
+	down ip link set eth1 down

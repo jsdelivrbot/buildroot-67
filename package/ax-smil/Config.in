@@ -1,0 +1,7 @@
+config BR2_PACKAGE_AX_SMIL
+	bool "ax-smil"
+	depends on BR2_PACKAGE_CAIRO
+	help
+	  ax-smil is a SMIL 3.0 player written in C++.
+
+	  https://git.axent.com.au/axent-smil-player/axent_smil_cpp

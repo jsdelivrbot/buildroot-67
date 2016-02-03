@@ -1,0 +1,3 @@
+INSERT OR REPLACE INTO clock (deviceName, frequency) VALUES ("fclk1", "2000000");
+INSERT OR REPLACE INTO display (deviceName, displayID, moduleID, greyDepth)
+    VALUES ("4aa00000.axent_ledfb", "10", "15", "4");

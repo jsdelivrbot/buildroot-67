@@ -1,0 +1,58 @@
+#!/usr/bin/python
+import sqlite3, datetime, time, jsonrpclib
+
+status_db = '/tmp/status.db'
+
+try:
+    with sqlite3.connect(config_db) as db:
+        json_port = int(db.execute(
+            'select jsonPort from server').fetchone()[0])
+
+        json_port = int(db.execute(
+            'select upperLimit from alarm where \
+             parameter="signCommsTimeout"').fetchone()[0])
+
+except:
+    json_port = 42000
+    time_out = 10
+
+try:
+    with sqlite3.connect(config_db) as db:
+        time_out = int(db.execute(
+            'select jsonPort from server').fetchone()[0])
+
+except:
+    time_out = 10
+
+active_alarm = False
+
+server = jsonrpclib.Server('http:127.0.0.1:%s' % str(json_port))
+
+while True:
+	alarm = False
+	try:
+		with sqlite3.connect(status_db) as db:
+		    db.row_factory = sqlite3.Row
+		    result = db.execute('select date from comms').fetchall()
+
+		for entry in result:
+
+			last_comms = datetime.datetime.strptime(str(entry[0]),
+			                                        '%Y-%m-%d %H:%M:%S.%f')
+
+			if int((datetime.datetime.now()-last_comms).total_seconds()) > time_out:
+				alarm = True
+
+			if alarm is True:
+				server.alarm.system_check()
+				active_alarm = True
+
+			else:
+				if active_alarm is True:
+					server.alarm.system_check()
+					active_alarm = False		
+
+	except:
+		print >> sys.stderr, 'Unexpected exception in sign comms monitor'
+
+	time.sleep(1)

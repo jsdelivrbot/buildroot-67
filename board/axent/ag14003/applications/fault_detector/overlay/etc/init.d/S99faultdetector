@@ -1,0 +1,7 @@
+#!/bin/sh
+#
+# Startup script for VMS fault detector.
+
+# Run JSON server.
+ax-server -c /usr/share/db/config.db -j 42000 >/dev/null 2>&1 &
+

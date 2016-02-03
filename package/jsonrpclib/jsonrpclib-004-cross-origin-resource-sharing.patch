@@ -1,0 +1,12 @@
+diff --git a/jsonrpclib/SimpleJSONRPCServer.py b/jsonrpclib/SimpleJSONRPCServer.py
+index 4649fa4..e20695a 100644
+--- a/jsonrpclib/SimpleJSONRPCServer.py
++++ b/jsonrpclib/SimpleJSONRPCServer.py
+@@ -185,6 +185,7 @@ class SimpleJSONRPCRequestHandler(
+                 except NotImplementedError:
+                     pass
+         self.send_header("Content-length", str(len(response)))
++        self.send_header("Access-Control-Allow-Origin", "*")
+         self.end_headers()
+         self.wfile.write(response)
+         self.wfile.flush()

@@ -1,0 +1,9 @@
+#!/bin/sh
+
+while true
+do
+  echo 62819 > /sys/bus/platform/devices/4aa00000.axent_ledfb/config
+  sleep 1
+  echo 62819 > /sys/bus/platform/devices/4aa40000.axent_ledfb/config
+  sleep 60
+done

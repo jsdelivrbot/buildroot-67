@@ -1,0 +1,63 @@
+#!/usr/bin/python
+import sqlite3, datetime
+
+config_db = '/usr/share/db/config.db'
+log_db = '/usr/share/db/log.db'
+rta_log_db = '/usr/share/db/rta_log.db'
+
+def power_values(sign_id, offset=0):
+    if int(offset) < 0 or int(offset) > 48:
+        raise Exception('Offset out of range')
+
+    battery_voltage = 0
+    battery_current = 0
+    solar_current = 0
+
+    now = datetime.datetime.now()
+    end = (now - datetime.timedelta(hours=int(offset)))
+    end_str = end.strftime('%Y-%m-%d %H:00')
+    start = (now - datetime.timedelta(hours=int(offset)+1))
+    start_str = start.strftime('%Y-%m-%d %H:00')    
+
+    with sqlite3.connect(log_db) as db:
+        result = db.execute('select battery_voltage, \
+                                    battery_current, \
+                                    solar_current from status_log \
+                                    where sign_id=%s and datetime(date) \
+                                    between datetime("%s") and datetime("%s") \
+                                    order by date' % (str(sign_id), 
+                                                      start_str, 
+                                                      end_str)).fetchall()        
+
+    if result is not None:
+        if len(result) > 0:
+            battery_voltage = float(result[0][0])
+            battery_current = float(result[0][1])
+            solar_current = float(result[0][2])
+            for values in result:
+                battery_voltage = (battery_voltage + float(values[0]))/2
+                battery_current = (battery_current + float(values[1]))/2
+                solar_current = (solar_current + float(values[2]))/2
+
+    battery_voltage = int(battery_voltage*10)
+    battery_current = int(battery_current*10)
+    solar_current = int(solar_current*10)
+
+    return [battery_voltage, battery_current, solar_current]
+
+with sqlite3.connect(config_db) as db:
+    result = db.execute('select sign_id from signs').fetchall()
+
+sign_list = [r[0] for r in result]
+
+with sqlite3.connect(rta_log_db) as db:
+    for sign in sign_list:
+        data = power_values(sign)
+        db.execute('insert into power_log (signID, \
+                                           batteryVoltage, \
+                                           batteryCurrent, \
+                                           solarCurrent) \
+                    values (?, ?, ?, ?)', (int(sign),
+                                           int(data[0]), 
+                                           int(data[1]), 
+                                           int(data[2])))

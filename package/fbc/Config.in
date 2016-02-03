@@ -1,0 +1,8 @@
+config BR2_PACKAGE_FBC
+	bool "fbc"
+	help
+	  fbc is a very simple utility which sets the colour map
+	  of a specified framebuffer device to a gamma curve with
+	  optional offsets for red, green and blue.
+
+	  http://github.com/danieldyer/fbc

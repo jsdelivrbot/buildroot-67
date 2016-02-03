@@ -1,0 +1,240 @@
+#!/usr/bin/python
+import socket, serial, rtacomms, jsonrpclib, sys, time, datetime, sqlite3
+import select, os, logging, logging.handlers
+
+logger = logging.getLogger('rta')
+
+log_handler = logging.handlers.RotatingFileHandler(
+    filename='/tmp/rta_log',
+    maxBytes=2**18,
+    backupCount=4)
+
+log_handler.setFormatter(logging.Formatter(
+    fmt='%(levelname)s: %(module)s,%(funcName)s@%(lineno)d:' \
+    + ' %(asctime)s -- %(message)s'))
+
+logger.addHandler(log_handler)
+
+logger.setLevel(logging.INFO)
+
+config_con = sqlite3.connect('/usr/share/db/config.db')
+config_con.row_factory = sqlite3.Row
+
+configs = dict(config_con.execute(
+    'select parameter, value from system').fetchall())
+
+# Get parameters from the main database.
+try:
+    port = int(configs['rtaPort'])
+except:
+    port = 43000
+
+try:
+    password_offset = int(configs['rtaPasswordOffset'], 16)
+except:
+    password_offset = 0x2bcd
+
+try:
+    password_seed_offset = int(configs['rtaPasswordSeedOffset'], 16)
+except:
+    password_seed_offset = 0x5b
+
+try:
+    controller_address = int(configs['rtaControllerAddress'])
+except:
+    controller_address = 1
+
+try:
+    display_timeout = int(configs['rtaDisplayTimeout'])
+except:
+    display_timeout = 300
+
+json_port = 42000
+
+# Get list of UARTs which have protocol set to 'RTA'.
+uarts = [dict(u) for u in \
+    config_con.execute('select * from serialport').fetchall() \
+    if u['protocol'] == 'RTA' and u['enabled'] == 'yes']
+
+rta_uarts = {}
+
+# Configure the UARTs.
+for u in uarts:
+    if u['flowControl'] == 'none':
+        u_rtscts = False
+        u_xonxoff = False
+    elif u['flowControl'] == 'xonxoff':
+        u_rtscts = False
+        u_xonxoff = True
+    elif u['flowControl'] == 'rtscts':
+        u_rtscts = True
+        u_xonxoff = False
+    
+    if u['stopBits'] == 1:
+        u_stopbits = serial.STOPBITS_ONE
+    elif u['stopBits'] == 1.5:
+        u_stopbits = serial.STOPBITS_ONE_POINT_FIVE
+    elif u['stopBits'] == 2:
+        u_stopbits = serial.STOPBITS_TWO
+    
+    if u['parity'] == 'none':
+        u_parity = serial.PARITY_NONE
+    elif u['parity'] == 'even':
+        u_parity = serial.PARITY_EVEN
+    elif u['parity'] == 'odd':
+        u_parity = serial.PARITY_ODD
+    elif u['parity'] == 'mark':
+        u_parity = serial.PARITY_MARK
+    elif u['parity'] == 'space':
+        u_parity = serial.PARITY_SPACE
+    
+    try:
+        rta_uarts[u['device']] = serial.Serial(
+            port=u['device'],
+            baudrate=int(u['baudRate']),
+            parity=u_parity,
+            stopbits=u_stopbits,
+            xonxoff=u_xonxoff,
+            rtscts=u_rtscts,
+            timeout=0)
+    except:
+        logger.error('Failed to initialise serial port: %s' % u['device'])
+
+# Open JSON-RPC connection.
+json_server = jsonrpclib.Server('http://127.0.0.1:%d' % json_port)
+socket.setdefaulttimeout(10)
+
+# Set up TCP server and UARTs.
+rta_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+rta_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+rta_socket.bind(('', port))
+rta_socket.listen(1)
+
+while 1:
+    session_active = False
+    current_uart = None
+    
+    last_tick = datetime.datetime.now()
+    timeout_counter = display_timeout
+    timeout_flag = False
+    
+    try:
+        logger.info('Waiting for new connection...')
+        
+        while 1:
+            current = datetime.datetime.now()
+            delta = (current - last_tick).total_seconds()
+            timeout_counter -= delta
+            last_tick = current
+            
+            if display_timeout > 0 and timeout_counter <= 0 \
+            and timeout_flag is not True:
+                logger.warning('Display timed out')
+                
+                try:
+                    if json_server.schedule.check_enabled() is False:
+                        # Clear the display.
+                        json_server.player.stop('vms')
+                        
+                        # Enable scheduler.
+                        json_server.schedule.disable_scheduler()
+                        json_server.schedule.refresh()
+                except:
+                    time.sleep(1)
+                else:
+                    timeout_flag = True
+            
+            # Check for new TCP connection.
+            rta_socket.settimeout(0)
+            try:
+                con, addr = rta_socket.accept()
+            except:
+                pass
+            else:
+                # We've got a new connection, terminate the old one and
+                # replace it with a new one.
+                logger.info('New TCP session started')
+                con.settimeout(0)
+                current_session = rtacomms.Session(
+                    con,
+                    json_server,
+                    password_offset,
+                    password_seed_offset,
+                    controller_address)
+                
+                session_active = True
+                current_uart = None
+                timeout_counter = display_timeout
+                timeout_flag = False
+            
+            # Check for new serial data.
+            new_data = select.select(rta_uarts.values(), [], [], 0)[0]
+            
+            for n in new_data:
+                if n.port in rta_uarts and n.port != current_uart:
+                    logger.info('New serial session started: %s' % n.port)
+                    try:
+                        con.close()
+                    except:
+                        pass
+                    
+                    # Create a new session.
+                    current_session = rtacomms.Session(
+                        n,
+                        json_server,
+                        password_offset,
+                        password_seed_offset,
+                        controller_address,
+                        rx_led,
+                        tx_led)
+                    
+                    session_active = False
+                    current_uart = n.port
+                    timeout_counter = display_timeout
+                    timeout_flag = False
+            
+            if session_active is True:
+                try:
+                    value = current_session.handle()
+                except rtacomms.EndSession:
+                    # Log link termination.
+                    logger.info('TCP session ended')
+                    session_active = False
+                    con.close()
+                    continue
+                except Exception as e:
+                    # Log link termination.
+                    logger.error('Unexpected session termination: %s' % e)
+                    import traceback
+                    logger.error(traceback.format_exc())
+                    session_active = False
+                    con.close()
+                    continue
+                else:
+                    if value is True:
+                        timeout_counter = display_timeout
+                        timeout_flag = False
+            elif current_uart is not None:
+                try:
+                    value = current_session.handle()
+                except rtacomms.EndSession:
+                    continue
+                except Exception as e:
+                    # Log link termination.
+                    logger.error('Unexpected session termination: %s' % e)
+                    import traceback
+                    logger.error(traceback.format_exc())
+                    continue
+                else:
+                    if value is True:
+                        timeout_counter = display_timeout
+                        timeout_flag = False
+            else:
+                time.sleep(0.1)
+    except:
+        logger.error('An error occurred, restarting server')
+        import traceback
+        logger.error(traceback.format_exc())
+        print 'An error occurred, restarting server'
+        print traceback.format_exc()
+        time.sleep(1)

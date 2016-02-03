@@ -1,0 +1,7 @@
+config BR2_PACKAGE_AX_DISPLAYUTILS
+	bool "ax-displayutils"
+	depends on BR2_PACKAGE_PYTHON
+	help
+	  Display configuration utilities for AG14003.
+
+	  https://git.axent.com.au/ag14003/axent_displayutils

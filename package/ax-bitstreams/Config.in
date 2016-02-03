@@ -1,0 +1,6 @@
+config BR2_PACKAGE_AX_BITSTREAMS
+	bool "Axent FPGA Bitstreams"
+	help
+	  The Axent bitstreams are programming files for the FPGA
+	  on board the AG11005 board, to allow it to drive different
+	  types of LED display.

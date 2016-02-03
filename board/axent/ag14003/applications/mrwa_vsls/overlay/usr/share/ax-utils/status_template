@@ -1,0 +1,57 @@
+CREATE TABLE status (
+    sign_id             INTEGER PRIMARY KEY,
+    system_time         TEXT,
+    temperature         TEXT,
+    humidity            TEXT,
+    uptime              INTEGER,
+    platform_version    TEXT,
+    application_version TEXT,
+    load_averages       TEXT,
+    ldr                 TEXT,
+    enabled             TEXT,
+    battery_voltage     TEXT,
+    battery_current     TEXT,
+    battery_power       TEXT,
+    solar_voltage       TEXT, 
+    solar_current       TEXT,
+    solar_power         TEXT,
+    dc_voltage          TEXT,
+    dc_current          TEXT,
+    dc_power            TEXT,
+    mains_status        TEXT,
+    brightness          INTEGER,
+    brightness_mode     TEXT,
+    test_mode           INTEGER,
+    running             TEXT,
+    document            TEXT,
+    annulus_open        INTEGER,
+    annulus_short       INTEGER,
+    annulus_visible     INTEGER,
+    annulus_driver      INTEGER,
+    matrix_open         INTEGER,
+    matrix_short        INTEGER,
+    matrix_visible      INTEGER,
+    matrix_driver       INTEGER,
+    tilt                INTEGER,
+    date                TEXT
+);
+
+CREATE TABLE comms (
+    sign_id             INTEGER PRIMARY KEY,
+    timeline_hash       INTEGER,
+    date                TEXT
+);
+
+CREATE TABLE timeline (
+    id                  INTEGER PRIMARY KEY,
+    start               TEXT,
+    end                 TEXT,
+    frame               INTEGER
+);
+
+CREATE TABLE alarms (
+    id                  INTEGER PRIMARY KEY,
+    sign_id             INTEGER,
+    parameter           TEXT,
+    active              TEXT
+);

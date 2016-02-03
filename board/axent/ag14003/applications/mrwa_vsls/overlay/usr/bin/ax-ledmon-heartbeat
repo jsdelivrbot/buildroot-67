@@ -1,0 +1,112 @@
+#!/bin/sh
+
+check_oc_fault() {
+    echo 1 > /sys/bus/platform/devices/4aa00000.axent_ledfb/command
+    echo 1 > /sys/bus/platform/devices/4aa40000.axent_ledfb/command
+}
+
+check_sc_fault() {
+    echo 2 > /sys/bus/platform/devices/4aa00000.axent_ledfb/command
+    echo 2 > /sys/bus/platform/devices/4aa40000.axent_ledfb/command
+}
+
+matrix_base=/sys/bus/platform/devices/4aa80000.axent_ledmon
+annulus_base=/sys/bus/platform/devices/4aab0000.axent_ledmon
+
+MATRIX_TOTAL=0
+MATRIX_VISIBLE=0
+MATRIX_FAULT=0
+ANNULUS_TOTAL=0
+ANNULUS_VISIBLE=0
+ANNULUS_FAULT=0
+
+NEW_MATRIX_TOTAL=0
+NEW_MATRIX_VISIBLE=0
+NEW_MATRIX_FAULT=0
+NEW_ANNULUS_TOTAL=0
+NEW_ANNULUS_VISIBLE=0
+NEW_ANNULUS_FAULT=0
+
+SIGN_IN_FAULT=0
+
+CHECK_SWITCH=0
+while true
+do
+    if [ $CHECK_SWITCH -eq 0 ] ; then
+        check_oc_fault
+        CHECK_SWITCH=1
+    elif [ $CHECK_SWITCH -eq 1 ] ; then
+        check_sc_fault
+        CHECK_SWITCH=0
+    fi
+    
+    NEW_MATRIX_TOTAL=$((`cat $matrix_base/open_errors` + `cat $matrix_base/short_errors` - 120))
+    NEW_MATRIX_TOTAL=$(($NEW_MATRIX_TOTAL > 0 ? $NEW_MATRIX_TOTAL : 0))
+    
+    NEW_MATRIX_VISIBLE=$((`cat $matrix_base/visible_errors` - 120))
+    NEW_MATRIX_VISIBLE=$(($NEW_MATRIX_VISIBLE > 0 ? $NEW_MATRIX_VISIBLE : 0))
+    
+    if  [ `cat $matrix_base/oe_err` -eq 1 ] || \
+        [ `cat $matrix_base/oe_err` -eq 1 ] || \
+        [ `cat $matrix_base/oe_err` -eq 1 ] ; then
+        NEW_MATRIX_FAULT=1
+    else
+        NEW_MATRIX_FAULT=0
+    fi
+    
+    NEW_ANNULUS_TOTAL=$((`cat $annulus_base/open_errors` - 72))
+    NEW_ANNULUS_TOTAL=$(($NEW_ANNULUS_TOTAL > 0 ? $NEW_ANNULUS_TOTAL : 0))
+        
+    NEW_ANNULUS_VISIBLE=$((`cat $annulus_base/visible_errors` - 120))
+    NEW_ANNULUS_VISIBLE=$(($NEW_ANNULUS_VISIBLE > 0 ? $NEW_ANNULUS_VISIBLE : 0))
+    
+    if  [ `cat $annulus_base/oe_err` -eq 1 ] || \
+        [ `cat $annulus_base/oe_err` -eq 1 ] || \
+        [ `cat $annulus_base/oe_err` -eq 1 ] ; then
+        NEW_ANNULUS_FAULT=1
+    else
+        NEW_ANNULUS_FAULT=0
+    fi
+    
+    if  [ $NEW_MATRIX_TOTAL -ne $MATRIX_TOTAL ] || \
+        [ $NEW_MATRIX_VISIBLE -ne $MATRIX_VISIBLE ] || \
+        [ $NEW_MATRIX_FAULT -ne $MATRIX_FAULT ] || \
+        [ $NEW_ANNULUS_TOTAL -ne $ANNULUS_TOTAL ] || \
+        [ $NEW_ANNULUS_VISIBLE -ne $ANNULUS_VISIBLE ] || \
+        [ $NEW_ANNULUS_FAULT -ne $ANNULUS_FAULT ] ; then
+        if  ([ $NEW_MATRIX_TOTAL > 0 ] || \
+            [ $NEW_MATRIX_VISIBLE > 0 ] || \
+            [ $NEW_MATRIX_FAULT > 0 ] || \
+            [ $NEW_ANNULUS_TOTAL > 0 ] || \
+            [ $NEW_ANNULUS_VISIBLE > 0 ] || \
+            [ $NEW_ANNULUS_FAULT > 0 ]) && [ $SIGN_IN_FAULT == 0 ] ; then
+            echo Fault occurred
+            echo Matrix total errors: $NEW_MATRIX_TOTAL
+            echo Matrix visible errors: $NEW_MATRIX_VISIBLE
+            echo Matrix display fault: $NEW_MATRIX_FAULT
+            echo Annulus total errors: $NEW_ANNULUS_TOTAL
+            echo Annulus visible errors: $NEW_ANNULUS_VISIBLE
+            echo Annulus display fault: $NEW_ANNULUS_FAULT
+            SIGN_IN_FAULT=1
+            wget http://localhost:42000 --header="Content-Type: application/json" --header="Accept: application/json" --post-data='{"jsonrpc": "2.0", "method": "alarm.system_check", "id": 1}' -s
+        elif [ $NEW_MATRIX_TOTAL == 0 ] && \
+            [ $NEW_MATRIX_VISIBLE == 0 ] && \
+            [ $NEW_MATRIX_FAULT == 0 ] && \
+            [ $NEW_ANNULUS_TOTAL == 0 ] && \
+            [ $NEW_ANNULUS_VISIBLE == 0 ] && \
+            [ $NEW_ANNULUS_FAULT == 0 ] && [ $SIGN_IN_FAULT == 1 ] ; then
+            echo Fault cleared
+            SIGN_IN_FAULT=0
+            wget http://localhost:42000 --header="Content-Type: application/json" --header="Accept: application/json" --post-data='{"jsonrpc": "2.0", "method": "alarm.system_check", "id": 1}' -s
+        fi
+    fi
+    
+    MATRIX_TOTAL=$NEW_MATRIX_TOTAL
+    MATRIX_VISIBLE=$NEW_MATRIX_VISIBLE
+    MATRIX_FAULT=$NEW_MATRIX_FAULT
+    ANNULUS_TOTAL=$NEW_ANNULUS_TOTAL
+    ANNULUS_VISIBLE=$NEW_ANNULUS_VISIBLE
+    ANNULUS_FAULT=$NEW_ANNULUS_FAULT
+    
+    sleep 1
+done

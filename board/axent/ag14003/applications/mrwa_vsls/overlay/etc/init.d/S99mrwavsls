@@ -1,0 +1,39 @@
+#!/bin/sh
+#
+# Startup script for MRWA VSLS controller.
+
+# Set up GPIOs
+echo 247 > /sys/class/gpio/export
+echo 248 > /sys/class/gpio/export
+echo 249 > /sys/class/gpio/export
+echo 250 > /sys/class/gpio/export
+
+# Run GPIO monitor heartbeat.
+gpio_monitor >/dev/null 2>&1 &
+
+ID=`sqlite3 /usr/share/db/config.db 'select value from system where parameter="signID"'`
+XBEE_DEV=`sqlite3 /usr/share/db/config.db 'select device from serialPort where protocol="mrwa" and enabled="yes"'`
+BAUDRATE=`sqlite3 /usr/share/db/config.db 'select baudRate from serialPort where protocol="mrwa" and enabled="yes"'`
+# Start the right commsd.
+if [ "$ID" == "1" ]
+then
+	master_commsd -b $BAUDRATE $XBEE_DEV >/dev/null 2>&1 &
+else
+	slave_commsd -b $BAUDRATE $XBEE_DEV >/dev/null 2>&1 &
+fi
+
+# Run RTA/STREAMS protocol deamons.
+rta_commsd >/dev/null 2>&1 &
+rta_feed >/dev/null 2>&1 &
+ 
+# Run sign status heartbeat.
+ax-status-heartbeat >/dev/null 2>&1 &
+ 
+# Run display configuration heartbeat.
+ax-display-heartbeat >/dev/null 2>&1 &
+
+# Run led fault monitor heartbeat.
+ax-ledmon-heartbeat >/dev/null 2>&1 &
+
+# Run sign comms monitor.
+sign-comms-monitor >/dev/null 2>&1 &

@@ -1,0 +1,147 @@
+CREATE TABLE fault_log (
+    uniqueID        INTEGER PRIMARY KEY,
+    controllerID    INTEGER,
+    date            TEXT,
+    errorCode       INTEGER,
+    occurred        INTEGER
+);
+
+CREATE TABLE open_fault_log (
+    uniqueID        INTEGER PRIMARY KEY,
+    signID          INTEGER,
+    date            TEXT,
+    errorCode       INTEGER,
+    cleared         INTEGER
+);
+
+CREATE TRIGGER open_fault_log_entry AFTER INSERT ON fault_log
+    FOR EACH ROW
+    WHEN NEW.occurred == 1
+    BEGIN
+        INSERT INTO open_fault_log (signID, date, errorCode)
+            VALUES (NEW.controllerID, NEW.date, NEW.errorCode);
+    END;
+
+CREATE TRIGGER open_fault_log_remove AFTER INSERT ON fault_log
+    FOR EACH ROW
+    WHEN NEW.occurred == 0
+    BEGIN
+        DELETE FROM open_fault_log WHERE (signID=NEW.controllerID and errorCode=NEW.errorCode);
+    END;
+
+CREATE TABLE limits (
+    entryName       TEXT PRIMARY KEY,
+    entryValue      
+);
+
+INSERT OR REPLACE INTO limits VALUES ('fault_log_limit', 256);
+INSERT OR REPLACE INTO limits VALUES ('fault_log_entries', 0);
+
+CREATE TRIGGER fault_log_entries_limit_trigger BEFORE INSERT ON fault_log
+    FOR EACH ROW
+    WHEN (SELECT entryValue FROM limits WHERE entryName = 'fault_log_entries')
+      >= (SELECT entryValue FROM limits WHERE entryName = 'fault_log_limit')
+    BEGIN
+        DELETE FROM fault_log
+            WHERE date = (SELECT date FROM fault_log ORDER BY date LIMIT 1);
+    END;
+
+CREATE TRIGGER fault_log_entries_count_insert_trigger AFTER INSERT ON fault_log
+    FOR EACH ROW
+    BEGIN
+        UPDATE limits SET entryValue = entryValue + 1
+            WHERE entryName = 'fault_log_entries';
+    END;
+
+CREATE TRIGGER fault_log_entries_count_delete_trigger AFTER DELETE ON fault_log
+    FOR EACH ROW
+    BEGIN
+        UPDATE limits SET entryValue = entryValue - 1
+            WHERE entryName = 'fault_log_entries';
+    END;
+
+CREATE TABLE event_log (
+    uniqueID        INTEGER PRIMARY KEY,
+    date            TEXT,
+    logID           INTEGER,
+    data            INTEGER
+);
+
+INSERT OR REPLACE INTO limits VALUES ('event_log_limit', 256);
+INSERT OR REPLACE INTO limits VALUES ('event_log_entries', 0);
+
+CREATE TRIGGER event_log_entries_limit_trigger BEFORE INSERT ON event_log
+    FOR EACH ROW
+    WHEN (SELECT entryValue FROM limits WHERE entryName = 'event_log_entries')
+      >= (SELECT entryValue FROM limits WHERE entryName = 'event_log_limit')
+    BEGIN
+        DELETE FROM event_log
+            WHERE date = (SELECT date FROM event_log ORDER BY date LIMIT 1);
+    END;
+
+CREATE TRIGGER event_log_entries_count_insert_trigger AFTER INSERT ON event_log
+    FOR EACH ROW
+    BEGIN
+        UPDATE limits SET entryValue = entryValue + 1
+            WHERE entryName = 'event_log_entries';
+    END;
+
+CREATE TRIGGER event_log_entries_count_delete_trigger AFTER DELETE ON event_log
+    FOR EACH ROW
+    BEGIN
+        UPDATE limits SET entryValue = entryValue - 1
+            WHERE entryName = 'event_log_entries';
+    END;
+
+CREATE TABLE operation_log (
+    uniqueID        INTEGER PRIMARY KEY,
+    date            TEXT,
+    oldFrame        INTEGER,
+    newFrame        INTEGER
+);
+
+INSERT OR REPLACE INTO limits VALUES ('operation_log_limit', 256);
+INSERT OR REPLACE INTO limits VALUES ('operation_log_entries', 0);
+
+CREATE TRIGGER operation_log_entries_limit_trigger BEFORE INSERT ON operation_log
+    FOR EACH ROW
+    WHEN (SELECT entryValue FROM limits WHERE entryName = 'operation_log_entries')
+      >= (SELECT entryValue FROM limits WHERE entryName = 'operation_log_limit')
+    BEGIN
+        DELETE FROM operation_log
+            WHERE date = (SELECT date FROM operation_log ORDER BY date LIMIT 1);
+    END;
+
+CREATE TRIGGER operation_log_entries_count_insert_trigger AFTER INSERT ON operation_log
+    FOR EACH ROW
+    BEGIN
+        UPDATE limits SET entryValue = entryValue + 1
+            WHERE entryName = 'operation_log_entries';
+    END;
+
+CREATE TRIGGER operation_log_entries_count_delete_trigger AFTER DELETE ON operation_log
+    FOR EACH ROW
+    BEGIN
+        UPDATE limits SET entryValue = entryValue - 1
+            WHERE entryName = 'operation_log_entries';
+    END;
+
+CREATE TABLE power_log (
+    uniqueID        INTEGER     PRIMARY KEY,
+    signID          INTEGER,
+    date            TEXT        DEFAULT CURRENT_TIMESTAMP,
+    offset          INTEGER     DEFAULT 0,
+    batteryCurrent  INTEGER,
+    batteryVoltage  INTEGER,
+    solarCurrent    INTEGER
+);
+
+INSERT OR REPLACE INTO limits VALUES ('sign_power_log_limit', 48);
+
+CREATE TRIGGER power_log_offset_trigger BEFORE INSERT ON power_log
+    FOR EACH ROW
+    BEGIN
+        UPDATE power_log SET offset = offset + 1 WHERE signID = NEW.signID;
+        DELETE FROM power_log
+            WHERE offset > (SELECT entryValue FROM limits WHERE entryName = 'sign_power_log_limit');
+    END;

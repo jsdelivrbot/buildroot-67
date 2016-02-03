@@ -1,0 +1,9 @@
+config BR2_PACKAGE_AX_UTILS_AG11005
+	bool "ax-utils-ag11005"
+	depends on BR2_PACKAGE_PYTHON
+	help
+	  ax-utils are a collection of utilities for Axent systems
+	  which do things like package management, disply configuration,
+	  network configuration and remote management and diagnostics.
+
+	  https://git.axent.com.au/ag11005-controller/axent_utils

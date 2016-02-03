@@ -1,0 +1,16 @@
+[connection]
+id=3g
+uuid=d883c26e-882c-4bd8-b568-791a5d123d54
+type=gsm
+
+[gsm]
+number=*99#
+apn=axent.au
+
+[ipv6]
+method=auto
+
+[ipv4]
+method=auto
+route1=192.168.10.0/24
+route2=192.168.1.0/24

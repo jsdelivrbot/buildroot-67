@@ -1,0 +1,13 @@
+#!/bin/sh
+
+DISPLAY_NAME=`sqlite3 /usr/share/db/config.db 'select deviceName from display'`
+
+while true
+do
+  echo 1 > /sys/bus/platform/devices/$DISPLAY_NAME/command
+  sleep 1
+  echo 2 > /sys/bus/platform/devices/$DISPLAY_NAME/command
+  sleep 1
+  cat /sys/bus/platform/devices/$DISPLAY_NAME/config > /sys/bus/platform/devices/$DISPLAY_NAME/config
+  sleep 30
+done

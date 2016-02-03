@@ -1,0 +1,2 @@
+# Sync hardware clock.
+0 2 * * * /sbin/hwclock -uw

@@ -1,0 +1,5 @@
+KERNEL!="mmcblk[0-9]p[0-9]", GOTO="sd_cards_auto_mount_end"
+
+ACTION=="add", RUN+="/bin/mount /dev/%k"
+ACTION=="remove", RUN+="/bin/umount /dev/%k"
+LABEL="sd_cards_auto_mount_end"

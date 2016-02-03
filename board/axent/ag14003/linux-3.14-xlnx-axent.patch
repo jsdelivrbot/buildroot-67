@@ -1,0 +1,2961 @@
+diff --git a/drivers/hwmon/Kconfig b/drivers/hwmon/Kconfig
+index 5ce43d8..3299397 100644
+--- a/drivers/hwmon/Kconfig
++++ b/drivers/hwmon/Kconfig
+@@ -956,6 +956,12 @@ config SENSORS_MCP3021
+ 	  This driver can also be built as a module.  If so, the module
+ 	  will be called mcp3021.
+ 
++config SENSORS_MMA865X
++	tristate "MMA865X accelerometer sensor driver"
++	depends on I2C
++	help
++	  Say yes here to support the Freescale's MMA865X accelerometer sensor
++
+ config SENSORS_NCT6775
+ 	tristate "Nuvoton NCT6775F and compatibles"
+ 	depends on !PPC
+diff --git a/drivers/hwmon/Makefile b/drivers/hwmon/Makefile
+index ec7cde0..200c253 100644
+--- a/drivers/hwmon/Makefile
++++ b/drivers/hwmon/Makefile
+@@ -110,6 +110,7 @@ obj-$(CONFIG_SENSORS_MAX6650)	+= max6650.o
+ obj-$(CONFIG_SENSORS_MAX6697)	+= max6697.o
+ obj-$(CONFIG_SENSORS_MC13783_ADC)+= mc13783-adc.o
+ obj-$(CONFIG_SENSORS_MCP3021)	+= mcp3021.o
++obj-$(CONFIG_SENSORS_MMA865X)	+= mma865x.o
+ obj-$(CONFIG_SENSORS_NCT6775)	+= nct6775.o
+ obj-$(CONFIG_SENSORS_NTC_THERMISTOR)	+= ntc_thermistor.o
+ obj-$(CONFIG_SENSORS_PC87360)	+= pc87360.o
+diff --git a/drivers/hwmon/ina2xx.c b/drivers/hwmon/ina2xx.c
+index 93d26e8..cb0de9c 100644
+--- a/drivers/hwmon/ina2xx.c
++++ b/drivers/hwmon/ina2xx.c
+@@ -148,8 +148,9 @@ static int ina2xx_get_value(struct ina2xx_data *data, u8 reg)
+ 
+ 	switch (reg) {
+ 	case INA2XX_SHUNT_VOLTAGE:
+-		val = DIV_ROUND_CLOSEST(data->regs[reg],
+-					data->config->shunt_div);
++		/* signed register */
++		val = DIV_ROUND_CLOSEST((s16)data->regs[reg],
++								data->config->shunt_div);
+ 		break;
+ 	case INA2XX_BUS_VOLTAGE:
+ 		val = (data->regs[reg] >> data->config->bus_voltage_shift)
+@@ -160,8 +161,8 @@ static int ina2xx_get_value(struct ina2xx_data *data, u8 reg)
+ 		val = data->regs[reg] * data->config->power_lsb;
+ 		break;
+ 	case INA2XX_CURRENT:
+-		/* LSB=1mA (selected). Is in mA */
+-		val = data->regs[reg];
++		/* signed register, LSB=1mA (selected), in mA */
++		val = (s16)data->regs[reg];
+ 		break;
+ 	default:
+ 		/* programmer goofed */
+diff --git a/drivers/hwmon/mma865x.c b/drivers/hwmon/mma865x.c
+new file mode 100755
+index 0000000..0bbfdd1
+--- /dev/null
++++ b/drivers/hwmon/mma865x.c
+@@ -0,0 +1,549 @@
++/*
++ *  mma865x.c - Linux kernel modules for 3-Axis Orientation/Motion
++ *  Detection Sensor MMA8652/MMA8653
++ *
++ *  Copyright (C) 2010-2011 Freescale Semiconductor, Inc. All Rights Reserved.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ *
++ *  This program is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
++ */
++
++#include <linux/module.h>
++#include <linux/init.h>
++#include <linux/slab.h>
++#include <linux/i2c.h>
++#include <linux/pm.h>
++#include <linux/mutex.h>
++#include <linux/delay.h>
++#include <linux/interrupt.h>
++#include <linux/irq.h>
++#include <linux/hwmon-sysfs.h>
++#include <linux/err.h>
++#include <linux/hwmon.h>
++#include <linux/input-polldev.h>
++
++
++#define MMA865X_I2C_ADDR	0x1D
++#define MMA8652_ID		0x4A
++#define MMA8653_ID		0x5A
++
++#define POLL_INTERVAL_MIN	1
++#define POLL_INTERVAL_MAX	200
++#define POLL_INTERVAL		50 /* msecs */
++// if sensor is standby ,set POLL_STOP_TIME to slow down the poll
++#define POLL_STOP_TIME		200  
++
++
++#define INPUT_FUZZ		32
++#define INPUT_FLAT		32
++#define MODE_CHANGE_DELAY_MS	100
++
++#define MMA865X_STATUS_ZYXDR	0x08
++#define MMA865X_BUF_SIZE	7
++
++/* register enum for mma865x registers */
++enum {
++	MMA865X_STATUS = 0x00,
++	MMA865X_OUT_X_MSB,
++	MMA865X_OUT_X_LSB,
++	MMA865X_OUT_Y_MSB,
++	MMA865X_OUT_Y_LSB,
++	MMA865X_OUT_Z_MSB,
++	MMA865X_OUT_Z_LSB,
++
++	MMA865X_F_SETUP = 0x09,
++	MMA865X_TRIG_CFG,
++	MMA865X_SYSMOD,
++	MMA865X_INT_SOURCE,
++	MMA865X_WHO_AM_I,
++	MMA865X_XYZ_DATA_CFG,
++	MMA865X_HP_FILTER_CUTOFF,
++
++	MMA865X_PL_STATUS,
++	MMA865X_PL_CFG,
++	MMA865X_PL_COUNT,
++	MMA865X_PL_BF_ZCOMP,
++	MMA865X_P_L_THS_REG,
++
++	MMA865X_FF_MT_CFG,
++	MMA865X_FF_MT_SRC,
++	MMA865X_FF_MT_THS,
++	MMA865X_FF_MT_COUNT,
++
++	MMA865X_TRANSIENT_CFG = 0x1D,
++	MMA865X_TRANSIENT_SRC,
++	MMA865X_TRANSIENT_THS,
++	MMA865X_TRANSIENT_COUNT,
++
++	MMA865X_PULSE_CFG,
++	MMA865X_PULSE_SRC,
++	MMA865X_PULSE_THSX,
++	MMA865X_PULSE_THSY,
++	MMA865X_PULSE_THSZ,
++	MMA865X_PULSE_TMLT,
++	MMA865X_PULSE_LTCY,
++	MMA865X_PULSE_WIND,
++
++	MMA865X_ASLP_COUNT,
++	MMA865X_CTRL_REG1,
++	MMA865X_CTRL_REG2,
++	MMA865X_CTRL_REG3,
++	MMA865X_CTRL_REG4,
++	MMA865X_CTRL_REG5,
++
++	MMA865X_OFF_X,
++	MMA865X_OFF_Y,
++	MMA865X_OFF_Z,
++
++	MMA865X_REG_END,
++};
++
++/* The sensitivity is represented in counts/g. In 2g mode the
++sensitivity is 1024 counts/g. In 4g mode the sensitivity is 512
++counts/g and in 8g mode the sensitivity is 256 counts/g.
++ */
++enum {
++	MODE_2G = 0,
++	MODE_4G,
++	MODE_8G,
++};
++
++enum {
++	MMA_STANDBY = 0,
++	MMA_ACTIVED,
++};
++struct mma865x_data_axis{
++	short x;
++	short y;
++	short z;
++};
++struct mma865x_data{
++	struct i2c_client * client;
++	struct input_polled_dev *poll_dev;
++	struct mutex data_lock;
++	int active;
++	int position;
++	u8 chip_id;
++	int mode;
++};
++
++static int enable_dbg = 0;
++
++static char * mma865x_names[] ={
++   "mma8652",
++   "mma8653",
++};
++static int mma865x_position_setting[8][3][3] =
++{
++   {{ 0, -1,  0}, { 1,  0,	0}, {0, 0,	1}},
++   {{-1,  0,  0}, { 0, -1,	0}, {0, 0,	1}},
++   {{ 0,  1,  0}, {-1,  0,	0}, {0, 0,	1}},
++   {{ 1,  0,  0}, { 0,  1,	0}, {0, 0,	1}},
++   
++   {{ 0, -1,  0}, {-1,  0,	0}, {0, 0,  -1}},
++   {{-1,  0,  0}, { 0,  1,	0}, {0, 0,  -1}},
++   {{ 0,  1,  0}, { 1,  0,	0}, {0, 0,  -1}},
++   {{ 1,  0,  0}, { 0, -1,	0}, {0, 0,  -1}},
++};
++
++static int mma865x_data_convert(struct mma865x_data* pdata,struct mma865x_data_axis *axis_data)
++{
++   short rawdata[3],data[3];
++   int i,j;
++   int position = pdata->position ;
++   if(position < 0 || position > 7 )
++   		position = 0;
++   rawdata [0] = axis_data->x ; rawdata [1] = axis_data->y ; rawdata [2] = axis_data->z ;  
++   for(i = 0; i < 3 ; i++)
++   {
++   	data[i] = 0;
++   	for(j = 0; j < 3; j++)
++		data[i] += rawdata[j] * mma865x_position_setting[position][i][j];
++   }
++   axis_data->x = data[0];
++   axis_data->y = data[1];
++   axis_data->z = data[2];
++   return 0;
++}
++static char * mma865x_id2name(u8 id){
++	int index = 0;
++	if(id == MMA8652_ID)
++		index = 0;
++	else if(id == MMA8653_ID)
++		index = 1;
++	return mma865x_names[index];
++}
++static int mma865x_device_init(struct i2c_client *client)
++{
++	int result;
++    struct mma865x_data *pdata = i2c_get_clientdata(client);
++	result = i2c_smbus_write_byte_data(client, MMA865X_CTRL_REG1, 0);
++	if (result < 0)
++		goto out;
++
++	result = i2c_smbus_write_byte_data(client, MMA865X_XYZ_DATA_CFG,
++					   pdata->mode);
++	if (result < 0)
++		goto out;
++	pdata->active = MMA_STANDBY;
++	msleep(MODE_CHANGE_DELAY_MS);
++	return 0;
++out:
++	dev_err(&client->dev, "error when init mma865x:(%d)", result);
++	return result;
++}
++static int mma865x_device_stop(struct i2c_client *client)
++{
++	u8 val;
++	val = i2c_smbus_read_byte_data(client, MMA865X_CTRL_REG1);
++	i2c_smbus_write_byte_data(client, MMA865X_CTRL_REG1,val & 0xfe);
++	return 0;
++}
++
++static int mma865x_read_data(struct i2c_client *client,struct mma865x_data_axis *data)
++{
++	u8 tmp_data[MMA865X_BUF_SIZE];
++	int ret;
++
++	ret = i2c_smbus_read_i2c_block_data(client,
++					    MMA865X_OUT_X_MSB, 7, tmp_data);
++	if (ret < MMA865X_BUF_SIZE) {
++		dev_err(&client->dev, "i2c block read failed\n");
++		return -EIO;
++	}
++	data->x = ((tmp_data[0] << 8) & 0xff00) | tmp_data[1];
++	data->y = ((tmp_data[2] << 8) & 0xff00) | tmp_data[3];
++	data->z = ((tmp_data[4] << 8) & 0xff00) | tmp_data[5];
++	return 0;
++}
++
++static void mma865x_report_data(struct mma865x_data* pdata)
++{
++	struct input_polled_dev * poll_dev = pdata->poll_dev;
++	struct mma865x_data_axis data;
++	mutex_lock(&pdata->data_lock);
++	if(pdata->active == MMA_STANDBY){
++		poll_dev->poll_interval = POLL_STOP_TIME;//if standby, set as 10s to slow down the poll
++		goto out;
++	}else{
++		if(poll_dev->poll_interval == POLL_STOP_TIME)
++			poll_dev->poll_interval = POLL_INTERVAL;
++	}
++	
++	if (mma865x_read_data(pdata->client,&data) != 0)
++		goto out;
++    mma865x_data_convert(pdata,&data);
++	input_report_abs(poll_dev->input, ABS_X, data.x);
++	input_report_abs(poll_dev->input, ABS_Y, data.y);
++	input_report_abs(poll_dev->input, ABS_Z, data.z);
++
++	if (enable_dbg) {
++			printk("xyz(%d,%d,%d)\n", data.x, data.y, data.z);
++	}
++
++	input_sync(poll_dev->input);
++out:
++	mutex_unlock(&pdata->data_lock);
++}
++
++static void mma865x_dev_poll(struct input_polled_dev *dev)
++{
++    struct mma865x_data* pdata = (struct mma865x_data*)dev->private;
++	mma865x_report_data(pdata);
++}
++
++ssize_t mma865x_delay_show(struct device *dev,
++		struct device_attribute *attr, char *buf)
++{
++	struct input_polled_dev *poll_dev = dev_get_drvdata(dev);
++    return sprintf(buf, "%d\n", poll_dev->poll_interval);
++}
++
++static ssize_t mma865x_debug_store(struct device *dev,
++		struct device_attribute *attr,
++		const char *buf, size_t count)
++{
++	unsigned long data;
++	int error;
++
++	error = strict_strtoul(buf, 10, &data);
++	if (error)
++		return error;
++	
++	enable_dbg = data;
++
++	return count;
++}
++
++static ssize_t mma865x_debug_show(struct device *dev,
++		struct device_attribute *attr, char *buf)
++{
++	return sprintf(buf, "%d\n", enable_dbg);
++}
++static ssize_t mma865x_delay_store(struct device *dev,
++		struct device_attribute *attr,
++		const char *buf, size_t count)
++{
++	unsigned long delay;
++	int error;
++
++	struct input_polled_dev *poll_dev = dev_get_drvdata(dev);
++
++	error = strict_strtoul(buf, 10, &delay);
++	if (error)
++		return error;
++	poll_dev->poll_interval = (delay > POLL_INTERVAL_MAX) ? POLL_INTERVAL_MAX: delay;
++	return count;
++}
++
++static ssize_t mma865x_enable_show(struct device *dev,
++				   struct device_attribute *attr, char *buf)
++{
++	struct input_polled_dev *poll_dev = dev_get_drvdata(dev);
++	struct mma865x_data *pdata = (struct mma865x_data *)(poll_dev->private);
++	struct i2c_client *client = pdata->client;
++	u8 val;
++    int enable;
++	
++	mutex_lock(&pdata->data_lock);
++	val = i2c_smbus_read_byte_data(client, MMA865X_CTRL_REG1);  
++	if((val & 0x01) && pdata->active == MMA_ACTIVED)
++		enable = 1;
++	else
++		enable = 0;
++	mutex_unlock(&pdata->data_lock);
++	return sprintf(buf, "%d\n", enable);
++}
++
++static ssize_t mma865x_enable_store(struct device *dev,
++				    struct device_attribute *attr,
++				    const char *buf, size_t count)
++{
++	struct input_polled_dev *poll_dev = dev_get_drvdata(dev);
++	struct mma865x_data *pdata = (struct mma865x_data *)(poll_dev->private);
++	struct i2c_client *client = pdata->client;
++	int ret;
++	unsigned long enable;
++	u8 val = 0;
++	enable = simple_strtoul(buf, NULL, 10);    
++	mutex_lock(&pdata->data_lock);
++	enable = (enable > 0) ? 1 : 0;
++    if(enable && pdata->active == MMA_STANDBY)
++	{  
++	   val = i2c_smbus_read_byte_data(client,MMA865X_CTRL_REG1);
++	   ret = i2c_smbus_write_byte_data(client, MMA865X_CTRL_REG1, val|0x01);  
++	   if(!ret){
++	   	 pdata->active = MMA_ACTIVED;
++		 printk("mma enable setting active \n");
++	    }
++	}
++	else if(enable == 0  && pdata->active == MMA_ACTIVED)
++	{
++		val = i2c_smbus_read_byte_data(client,MMA865X_CTRL_REG1);
++	    ret = i2c_smbus_write_byte_data(client, MMA865X_CTRL_REG1,val & 0xFE);
++		if(!ret){
++		 pdata->active= MMA_STANDBY;
++		 printk("mma enable setting inactive \n");
++		}
++	}
++	mutex_unlock(&pdata->data_lock);
++	return count;
++}
++static ssize_t mma865x_position_show(struct device *dev,
++				   struct device_attribute *attr, char *buf)
++{
++    struct input_polled_dev *poll_dev = dev_get_drvdata(dev);
++	struct mma865x_data *pdata = (struct mma865x_data *)(poll_dev->private);
++    int position = 0;
++	mutex_lock(&pdata->data_lock);
++    position = pdata->position ;
++	mutex_unlock(&pdata->data_lock);
++	return sprintf(buf, "%d\n", position);
++}
++
++static ssize_t mma865x_position_store(struct device *dev,
++				    struct device_attribute *attr,
++				    const char *buf, size_t count)
++{
++    struct input_polled_dev *poll_dev = dev_get_drvdata(dev);
++	struct mma865x_data *pdata = (struct mma865x_data *)(poll_dev->private);
++	int  position;
++	position = simple_strtoul(buf, NULL, 10);    
++	mutex_lock(&pdata->data_lock);
++    pdata->position = position;
++	mutex_unlock(&pdata->data_lock);
++	return count;
++}
++
++static DEVICE_ATTR(delay, S_IWUSR | S_IRUGO,
++		   mma865x_delay_show, mma865x_delay_store);
++static DEVICE_ATTR(debug, S_IWUSR | S_IRUGO,
++		   mma865x_debug_show, mma865x_debug_store);
++static DEVICE_ATTR(enable, S_IWUSR | S_IRUGO,
++		   mma865x_enable_show, mma865x_enable_store);
++static DEVICE_ATTR(position, S_IWUSR | S_IRUGO,
++		   mma865x_position_show, mma865x_position_store);
++
++static struct attribute *mma865x_attributes[] = {
++	&dev_attr_enable.attr,
++	&dev_attr_position.attr,
++	&dev_attr_delay.attr,
++	&dev_attr_debug.attr,
++	NULL
++};
++
++static const struct attribute_group mma865x_attr_group = {
++	.attrs = mma865x_attributes,
++};
++
++static int mma865x_probe(struct i2c_client *client,
++				   const struct i2c_device_id *id)
++{
++	int result, chip_id;
++	struct input_dev *idev;
++	struct mma865x_data *pdata;
++	struct i2c_adapter *adapter;
++	struct input_polled_dev *poll_dev;
++	adapter = to_i2c_adapter(client->dev.parent);
++	result = i2c_check_functionality(adapter,
++					 I2C_FUNC_SMBUS_BYTE |
++					 I2C_FUNC_SMBUS_BYTE_DATA);
++	if (!result)
++		goto err_out;
++	
++	chip_id = i2c_smbus_read_byte_data(client, MMA865X_WHO_AM_I);
++
++	if (chip_id != MMA8652_ID && chip_id != MMA8653_ID  ) {
++		dev_err(&client->dev,
++			"read chip ID 0x%x is not equal to 0x%x or 0x%x!\n",
++			result, MMA8652_ID, MMA8653_ID);
++		result = -EINVAL;
++		goto err_out;
++	}
++    pdata = kzalloc(sizeof(struct mma865x_data), GFP_KERNEL);
++	if(!pdata){
++		result = -ENOMEM;
++		dev_err(&client->dev, "alloc data memory error!\n");
++		goto err_out;
++    }
++	/* Initialize the MMA865X chip */
++	pdata->client = client;
++	pdata->chip_id = chip_id;
++	pdata->mode = MODE_2G;
++	pdata->position = 0;
++	mutex_init(&pdata->data_lock);
++	i2c_set_clientdata(client,pdata);
++	mma865x_device_init(client);
++	poll_dev = input_allocate_polled_device();
++	if (!poll_dev) {
++		result = -ENOMEM;
++		dev_err(&client->dev, "alloc poll device failed!\n");
++		goto err_alloc_poll_device;
++	}
++	poll_dev->poll = mma865x_dev_poll;
++	poll_dev->poll_interval = POLL_STOP_TIME;
++	poll_dev->poll_interval_min = POLL_INTERVAL_MIN;
++	poll_dev->poll_interval_max = POLL_INTERVAL_MAX;
++	poll_dev->private = pdata;
++	idev = poll_dev->input;
++	idev->name = "mma865x";
++	idev->uniq = mma865x_id2name(pdata->chip_id);
++	idev->id.bustype = BUS_I2C;
++	idev->evbit[0] = BIT_MASK(EV_ABS);
++	input_set_abs_params(idev, ABS_X, -0x7fff, 0x7fff, INPUT_FUZZ, INPUT_FLAT);
++	input_set_abs_params(idev, ABS_Y, -0x7fff, 0x7fff, INPUT_FUZZ, INPUT_FLAT);
++	input_set_abs_params(idev, ABS_Z, -0x7fff, 0x7fff, INPUT_FUZZ, INPUT_FLAT);
++    pdata->poll_dev = poll_dev;
++	result = input_register_polled_device(pdata->poll_dev);
++	if (result) {
++		dev_err(&client->dev, "register poll device failed!\n");
++		goto err_register_polled_device;
++	}
++    result = sysfs_create_group(&idev->dev.kobj, &mma865x_attr_group);
++	if (result) {
++		dev_err(&client->dev, "create device file failed!\n");
++		result = -EINVAL;
++		goto err_create_sysfs;
++	}
++	printk("mma865x device driver probe successfully\n");
++	return 0;
++err_create_sysfs:
++	input_unregister_polled_device(pdata->poll_dev);
++err_register_polled_device:
++	input_free_polled_device(poll_dev);
++err_alloc_poll_device:
++	kfree(pdata);
++err_out:
++	return result;
++}
++static int mma865x_remove(struct i2c_client *client)
++{
++	struct mma865x_data *pdata = i2c_get_clientdata(client);
++	struct input_polled_dev *poll_dev = pdata->poll_dev;
++	mma865x_device_stop(client);
++	if(pdata){
++		input_unregister_polled_device(poll_dev);
++		input_free_polled_device(poll_dev);
++		kfree(pdata);
++	}
++	return 0;
++}
++
++#ifdef CONFIG_PM_SLEEP
++static int mma865x_suspend(struct device *dev)
++{
++	struct i2c_client *client = to_i2c_client(dev);
++    struct mma865x_data *pdata = i2c_get_clientdata(client);
++    if(pdata->active == MMA_ACTIVED)
++		mma865x_device_stop(client);
++	return 0;
++}
++
++static int mma865x_resume(struct device *dev)
++{
++    int val = 0;
++	struct i2c_client *client = to_i2c_client(dev);
++    struct mma865x_data *pdata = i2c_get_clientdata(client);
++    if(pdata->active == MMA_ACTIVED){
++	   val = i2c_smbus_read_byte_data(client,MMA865X_CTRL_REG1);
++	   i2c_smbus_write_byte_data(client, MMA865X_CTRL_REG1, val|0x01);  
++    }
++	return 0;
++	  
++}
++#endif
++
++static const struct i2c_device_id mma865x_id[] = {
++	{"mma865x", 0},
++	{ }
++};
++MODULE_DEVICE_TABLE(i2c, mma865x_id);
++
++static SIMPLE_DEV_PM_OPS(mma865x_pm_ops, mma865x_suspend, mma865x_resume);
++static struct i2c_driver mma865x_driver = {
++	.driver = {
++		   .name = "mma865x",
++		   .owner = THIS_MODULE,
++		   .pm = &mma865x_pm_ops,
++		   },
++	.probe = mma865x_probe,
++	.remove = mma865x_remove,
++	.id_table = mma865x_id,
++};
++
++MODULE_AUTHOR("Freescale Semiconductor, Inc.");
++MODULE_DESCRIPTION("MMA865X 3-Axis Orientation/Motion Detection Sensor driver");
++MODULE_LICENSE("GPL");
++
++module_i2c_driver(mma865x_driver);
+diff --git a/drivers/iio/adc/max1363.c b/drivers/iio/adc/max1363.c
+index 3602592..693492e 100644
+--- a/drivers/iio/adc/max1363.c
++++ b/drivers/iio/adc/max1363.c
+@@ -1442,8 +1442,7 @@ static int max1363_initial_setup(struct max1363_state *st)
+ 	if (st->vref)
+ 		st->setupbyte |= MAX1363_SETUP_AIN3_IS_REF_EXT_TO_REF;
+ 	else
+-		st->setupbyte |= MAX1363_SETUP_POWER_UP_INT_REF
+-		  | MAX1363_SETUP_AIN3_IS_AIN3_REF_IS_INT;
++		st->setupbyte |= MAX1363_SETUP_AIN3_IS_AIN3_REF_IS_VDD;
+ 
+ 	/* Set scan mode writes the config anyway so wait until then */
+ 	st->setupbyte = MAX1363_SETUP_BYTE(st->setupbyte);
+diff --git a/drivers/mmc/host/sdhci-of-arasan.c b/drivers/mmc/host/sdhci-of-arasan.c
+index f7c7cf6..46fe636 100644
+--- a/drivers/mmc/host/sdhci-of-arasan.c
++++ b/drivers/mmc/host/sdhci-of-arasan.c
+@@ -20,8 +20,11 @@
+  */
+ 
+ #include <linux/module.h>
++#include <linux/of.h>
+ #include "sdhci-pltfm.h"
+ 
++#include "sdhci.h" // to read capabilities from the host
++
+ #define SDHCI_ARASAN_CLK_CTRL_OFFSET	0x2c
+ 
+ #define CLK_CTRL_TIMEOUT_SHIFT		16
+@@ -169,6 +172,26 @@ static int sdhci_arasan_probe(struct platform_device *pdev)
+ 	pltfm_host = sdhci_priv(host);
+ 	pltfm_host->priv = sdhci_arasan;
+ 	pltfm_host->clk = clk_xin;
++	
++	struct device_node *np = pdev->dev.of_node;
++	u32 emio = 0;
++
++	if (of_device_is_available(np) && of_property_read_u32(np,"xlnx,emio",&emio) == 0) {
++		if (emio) {
++			dev_info(&pdev->dev, "SD routed through EMIO: Disabling SDHCI High-speed\n");
++			/* The SD lines have been routed through the Zynq EMIO interface
++			* which is limited to 25MHz.  Spoof the SDHCI caps to remove
++			* high-speed support.
++			*/
++			host->quirks |= SDHCI_QUIRK_MISSING_CAPS;
++			// WARNING: This may fail because sdhci_reset() is not called before
++			host->caps = sdhci_readl(host, SDHCI_CAPABILITIES) & ~(SDHCI_CAN_DO_HISPD);
++			host->caps1 = sdhci_readl(host, SDHCI_CAPABILITIES_1);
++		} else {
++			dev_info(&pdev->dev, "SD routed through MIO: SDHCI High-speed enabled\n");
++		}
++	}
++
+ 
+ 	ret = sdhci_add_host(host);
+ 	if (ret) {
+diff --git a/drivers/net/ethernet/xilinx/xilinx_emacps.c b/drivers/net/ethernet/xilinx/xilinx_emacps.c
+index ebdfdab..66db9dd 100644
+--- a/drivers/net/ethernet/xilinx/xilinx_emacps.c
++++ b/drivers/net/ethernet/xilinx/xilinx_emacps.c
+@@ -823,6 +823,12 @@ static int xemacps_mii_init(struct net_local *lp)
+ 	struct resource res;
+ 	struct device_node *np = of_get_parent(lp->phy_node);
+ 	struct device_node *npp;
++    struct device* dev = &lp->pdev->dev;
++
++    if ((lp->mii_bus = of_mdio_find_bus(np))){
++           dev_info(dev, "re-using mdio bus");
++           return 0;
++    }
+ 
+ 	lp->mii_bus = mdiobus_alloc();
+ 	if (lp->mii_bus == NULL) {
+diff --git a/drivers/rtc/Kconfig b/drivers/rtc/Kconfig
+index db933de..50849a7 100644
+--- a/drivers/rtc/Kconfig
++++ b/drivers/rtc/Kconfig
+@@ -288,6 +288,16 @@ config RTC_DRV_MAX77686
+ 	  This driver can also be built as a module. If so, the module
+ 	  will be called rtc-max77686.
+ 
++config RTC_DRV_MCP7940
++	tristate "Microchip MCP7940"
++	depends on I2C
++	help
++	  If you say yes here you will get support for the
++	  Microchip MCP7940.
++	  
++	  This driver can also be built as a module. If so, the module
++	  will be called rtc-mcp7940.
++
+ config RTC_DRV_RS5C372
+ 	tristate "Ricoh R2025S/D, RS5C372A/B, RV5C386, RV5C387A"
+ 	help
+diff --git a/drivers/rtc/Makefile b/drivers/rtc/Makefile
+index b427bf7..70aaf97 100644
+--- a/drivers/rtc/Makefile
++++ b/drivers/rtc/Makefile
+@@ -79,6 +79,7 @@ obj-$(CONFIG_RTC_DRV_MAX8997)	+= rtc-max8997.o
+ obj-$(CONFIG_RTC_DRV_MAX6902)	+= rtc-max6902.o
+ obj-$(CONFIG_RTC_DRV_MAX77686)	+= rtc-max77686.o
+ obj-$(CONFIG_RTC_DRV_MC13XXX)	+= rtc-mc13xxx.o
++obj-$(CONFIG_RTC_DRV_MCP7940)	+= rtc-mcp7940.o
+ obj-$(CONFIG_RTC_DRV_MSM6242)	+= rtc-msm6242.o
+ obj-$(CONFIG_RTC_DRV_MPC5121)	+= rtc-mpc5121.o
+ obj-$(CONFIG_RTC_DRV_MV)	+= rtc-mv.o
+diff --git a/drivers/rtc/rtc-mcp7940.c b/drivers/rtc/rtc-mcp7940.c
+new file mode 100644
+index 0000000..4a509eb
+--- /dev/null
++++ b/drivers/rtc/rtc-mcp7940.c
+@@ -0,0 +1,693 @@
++/*
++ * rtc-mcp7940.c - RTC driver for some mostly-compatible I2C chips.
++ *
++ *  Copyright (C) 2005 James Chapman (ds1337 core)
++ *  Copyright (C) 2006 David Brownell
++ *  Copyright (C) 2009 Matthias Fuchs (rx8025 support)
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#include <linux/module.h>
++#include <linux/init.h>
++#include <linux/slab.h>
++#include <linux/i2c.h>
++#include <linux/string.h>
++#include <linux/rtc.h>
++#include <linux/bcd.h>
++
++
++
++/* We can't determine type by probing, but if we expect pre-Linux code
++ * to have set the chip up as a clock (turning on the oscillator and
++ * setting the date and time), Linux can ignore the non-clock features.
++ * That's a natural job for a factory or repair bench.
++ */
++enum ds_type {
++	mcp7940,
++	// rs5c372 too?  different address...
++};
++
++
++/* RTC registers don't differ much, except for the century flag */
++#define MCP7940_REG_SECS		0x00	/* 00-59 */
++#	define MCP7940_BIT_CH		0x80
++#	define DS1340_BIT_nEOSC		0x80
++#	define MCP7940_BIT_ST          0x80
++#define MCP7940_REG_MIN		0x01	/* 00-59 */
++#define MCP7940_REG_HOUR		0x02	/* 00-23, or 1-12{am,pm} */
++#	define MCP7940_BIT_12HR		0x40	/* in REG_HOUR */
++#	define MCP7940_BIT_PM		0x20	/* in REG_HOUR */
++#	define DS1340_BIT_CENTURY_EN	0x80	/* in REG_HOUR */
++#	define DS1340_BIT_CENTURY	0x40	/* in REG_HOUR */
++#define MCP7940_REG_WDAY		0x03	/* 01-07 */
++#define MCP7940_REG_MDAY		0x04	/* 01-31 */
++#define MCP7940_REG_MONTH	0x05	/* 01-12 */
++#	define DS1337_BIT_CENTURY	0x80	/* in REG_MONTH */
++#define MCP7940_REG_YEAR		0x06	/* 00-99 */
++#      define MCP7940_BIT_VBATEN      0x08
++
++/* Other registers (control, status, alarms, trickle charge, NVRAM, etc)
++ * start at 7, and they differ a LOT. Only control and status matter for
++ * basic RTC date and time functionality; be careful using them.
++ */
++#define MCP7940_REG_CONTROL	0x07		/* or ds1338 */
++#	define MCP7940_BIT_OUT		0x80
++#	define DS1338_BIT_OSF		0x20
++#	define MCP7940_BIT_SQWE		0x10
++#	define MCP7940_BIT_RS1		0x02
++#	define MCP7940_BIT_RS0		0x01
++#define DS1337_REG_CONTROL	0x0e
++#	define DS1337_BIT_nEOSC		0x80
++#	define DS1339_BIT_BBSQI		0x20
++#	define DS3231_BIT_BBSQW		0x40 /* same as BBSQI */
++#	define DS1337_BIT_RS2		0x10
++#	define DS1337_BIT_RS1		0x08
++#	define DS1337_BIT_INTCN		0x04
++#	define DS1337_BIT_A2IE		0x02
++#	define DS1337_BIT_A1IE		0x01
++#define DS1340_REG_CONTROL	0x07
++#	define DS1340_BIT_OUT		0x80
++#	define DS1340_BIT_FT		0x40
++#	define DS1340_BIT_CALIB_SIGN	0x20
++#	define DS1340_M_CALIBRATION	0x1f
++#define DS1340_REG_FLAG		0x09
++#	define DS1340_BIT_OSF		0x80
++#define DS1337_REG_STATUS	0x0f
++#	define DS1337_BIT_OSF		0x80
++#	define DS1337_BIT_A2I		0x02
++#	define DS1337_BIT_A1I		0x01
++#define DS1339_REG_ALARM1_SECS	0x07
++#define DS1339_REG_TRICKLE	0x10
++
++#define RX8025_REG_CTRL1	0x0e
++#	define RX8025_BIT_2412		0x20
++#define RX8025_REG_CTRL2	0x0f
++#	define RX8025_BIT_PON		0x10
++#	define RX8025_BIT_VDET		0x40
++#	define RX8025_BIT_XST		0x20
++
++
++struct mcp7940 {
++	u8			offset; /* register's offset */
++	u8			regs[11];
++	enum ds_type		type;
++	unsigned long		flags;
++#define HAS_NVRAM	0		/* bit 0 == sysfs file active */
++#define HAS_ALARM	1		/* bit 1 == irq claimed */
++	struct i2c_client	*client;
++	struct rtc_device	*rtc;
++	struct work_struct	work;
++	s32 (*read_block_data)(const struct i2c_client *client, u8 command,
++			       u8 length, u8 *values);
++	s32 (*write_block_data)(const struct i2c_client *client, u8 command,
++				u8 length, const u8 *values);
++};
++
++struct chip_desc {
++	unsigned		nvram56:1;
++	unsigned		alarm:1;
++};
++
++static const struct chip_desc chips[] = {
++[mcp7940] = {
++},
++};
++
++static const struct i2c_device_id mcp7940_id[] = {
++	{ "mcp7940", mcp7940 },
++	{ }
++};
++MODULE_DEVICE_TABLE(i2c, mcp7940_id);
++
++/*----------------------------------------------------------------------*/
++
++#define BLOCK_DATA_MAX_TRIES 10
++
++static s32 mcp7940_read_block_data_once(const struct i2c_client *client, u8 command,
++				  u8 length, u8 *values)
++{
++	s32 i, data;
++
++	for (i = 0; i < length; i++) {
++		data = i2c_smbus_read_byte_data(client, command + i);
++		if (data < 0)
++			return data;
++		values[i] = data;
++	}
++	return i;
++}
++
++static s32 mcp7940_read_block_data(const struct i2c_client *client, u8 command,
++				  u8 length, u8 *values)
++{
++	u8 oldvalues[I2C_SMBUS_BLOCK_MAX];
++	s32 ret;
++	int tries = 0;
++
++	dev_dbg(&client->dev, "mcp7940_read_block_data (length=%d)\n", length);
++	ret = mcp7940_read_block_data_once(client, command, length, values);
++	if (ret < 0)
++		return ret;
++	do {
++		if (++tries > BLOCK_DATA_MAX_TRIES) {
++			dev_err(&client->dev,
++				"mcp7940_read_block_data failed\n");
++			return -EIO;
++		}
++		memcpy(oldvalues, values, length);
++		ret = mcp7940_read_block_data_once(client, command, length,
++						  values);
++		if (ret < 0)
++			return ret;
++	} while (memcmp(oldvalues, values, length));
++	return length;
++}
++
++static s32 mcp7940_write_block_data(const struct i2c_client *client, u8 command,
++				   u8 length, const u8 *values)
++{
++	u8 currvalues[I2C_SMBUS_BLOCK_MAX];
++	int tries = 0;
++
++	dev_dbg(&client->dev, "mcp7940_write_block_data (length=%d)\n", length);
++	do {
++		s32 i, ret;
++
++		if (++tries > BLOCK_DATA_MAX_TRIES) {
++			dev_err(&client->dev,
++				"mcp7940_write_block_data failed\n");
++			return -EIO;
++		}
++		for (i = 0; i < length; i++) {
++			ret = i2c_smbus_write_byte_data(client, command + i,
++							values[i]);
++			if (ret < 0)
++				return ret;
++		}
++		ret = mcp7940_read_block_data_once(client, command, length,
++						  currvalues);
++		if (ret < 0)
++			return ret;
++	} while (memcmp(currvalues, values, length));
++	return length;
++}
++
++/*----------------------------------------------------------------------*/
++
++/*
++ * The IRQ logic includes a "real" handler running in IRQ context just
++ * long enough to schedule this workqueue entry.   We need a task context
++ * to talk to the RTC, since I2C I/O calls require that; and disable the
++ * IRQ until we clear its status on the chip, so that this handler can
++ * work with any type of triggering (not just falling edge).
++ *
++ * The ds1337 and ds1339 both have two alarms, but we only use the first
++ * one (with a "seconds" field).  For ds1337 we expect nINTA is our alarm
++ * signal; ds1339 chips have only one alarm signal.
++ */
++/*
++static void mcp7940_work(struct work_struct *work)
++{
++	struct mcp7940		*mcp7940;
++	struct i2c_client	*client;
++	struct mutex		*lock;
++	int			stat, control;
++
++	mcp7940 = container_of(work, struct mcp7940, work);
++	client = mcp7940->client;
++	lock = &mcp7940->rtc->ops_lock;
++
++	mutex_lock(lock);
++	stat = i2c_smbus_read_byte_data(client, DS1337_REG_STATUS);
++	if (stat < 0)
++		goto out;
++
++	if (stat & DS1337_BIT_A1I) {
++		stat &= ~DS1337_BIT_A1I;
++		i2c_smbus_write_byte_data(client, DS1337_REG_STATUS, stat);
++
++		control = i2c_smbus_read_byte_data(client, DS1337_REG_CONTROL);
++		if (control < 0)
++			goto out;
++
++		control &= ~DS1337_BIT_A1IE;
++		i2c_smbus_write_byte_data(client, DS1337_REG_CONTROL, control);
++
++		rtc_update_irq(mcp7940->rtc, 1, RTC_AF | RTC_IRQF);
++	}
++
++out:
++	if (test_bit(HAS_ALARM, &mcp7940->flags))
++		enable_irq(client->irq);
++	mutex_unlock(lock);
++}
++
++static irqreturn_t mcp7940_irq(int irq, void *dev_id)
++{
++	struct i2c_client	*client = dev_id;
++	struct mcp7940		*mcp7940 = i2c_get_clientdata(client);
++
++	disable_irq_nosync(irq);
++	schedule_work(&mcp7940->work);
++	return IRQ_HANDLED;
++}
++*/
++/*----------------------------------------------------------------------*/
++
++static int mcp7940_get_time(struct device *dev, struct rtc_time *t)
++{
++	struct mcp7940	*mcp7940 = dev_get_drvdata(dev);
++	int		tmp;
++
++	/* read the RTC date and time registers all at once */
++	tmp = mcp7940->read_block_data(mcp7940->client,
++		mcp7940->offset, 7, mcp7940->regs);
++	if (tmp != 7) {
++		dev_err(dev, "%s error %d\n", "read", tmp);
++		return -EIO;
++	}
++
++	dev_dbg(dev, "%s: %02x %02x %02x %02x %02x %02x %02x\n",
++			"read",
++			mcp7940->regs[0], mcp7940->regs[1],
++			mcp7940->regs[2], mcp7940->regs[3],
++			mcp7940->regs[4], mcp7940->regs[5],
++			mcp7940->regs[6]);
++
++	t->tm_sec = bcd2bin(mcp7940->regs[MCP7940_REG_SECS] & 0x7f);
++	t->tm_min = bcd2bin(mcp7940->regs[MCP7940_REG_MIN] & 0x7f);
++	tmp = mcp7940->regs[MCP7940_REG_HOUR] & 0x3f;
++	t->tm_hour = bcd2bin(tmp);
++	t->tm_wday = bcd2bin(mcp7940->regs[MCP7940_REG_WDAY] & 0x07) - 1;
++	t->tm_mday = bcd2bin(mcp7940->regs[MCP7940_REG_MDAY] & 0x3f);
++	tmp = mcp7940->regs[MCP7940_REG_MONTH] & 0x1f;
++	t->tm_mon = bcd2bin(tmp) - 1;
++
++	/* assume 20YY not 19YY, and ignore DS1337_BIT_CENTURY */
++	t->tm_year = bcd2bin(mcp7940->regs[MCP7940_REG_YEAR]) + 100;
++
++	dev_dbg(dev, "%s secs=%d, mins=%d, "
++		"hours=%d, mday=%d, mon=%d, year=%d, wday=%d\n",
++		"read", t->tm_sec, t->tm_min,
++		t->tm_hour, t->tm_mday,
++		t->tm_mon, t->tm_year, t->tm_wday);
++
++	/* initial clock setting can be undefined */
++	return rtc_valid_tm(t);
++}
++
++static int mcp7940_set_time(struct device *dev, struct rtc_time *t)
++{
++	struct mcp7940	*mcp7940 = dev_get_drvdata(dev);
++	int		result;
++	int		tmp;
++	u8		*buf = mcp7940->regs;
++
++	dev_dbg(dev, "%s secs=%d, mins=%d, "
++		"hours=%d, mday=%d, mon=%d, year=%d, wday=%d\n",
++		"write", t->tm_sec, t->tm_min,
++		t->tm_hour, t->tm_mday,
++		t->tm_mon, t->tm_year, t->tm_wday);
++
++	buf[MCP7940_REG_SECS] = bin2bcd(t->tm_sec);
++	buf[MCP7940_REG_MIN] = bin2bcd(t->tm_min);
++	buf[MCP7940_REG_HOUR] = bin2bcd(t->tm_hour);
++	buf[MCP7940_REG_WDAY] = bin2bcd(t->tm_wday + 1);
++	buf[MCP7940_REG_MDAY] = bin2bcd(t->tm_mday);
++	buf[MCP7940_REG_MONTH] = bin2bcd(t->tm_mon + 1);
++
++	/* assume 20YY not 19YY */
++	tmp = t->tm_year - 100;
++	buf[MCP7940_REG_YEAR] = bin2bcd(tmp);
++
++		buf[MCP7940_REG_SECS] |= MCP7940_BIT_ST;
++		buf[MCP7940_REG_WDAY] |= MCP7940_BIT_VBATEN;
++
++
++	dev_dbg(dev, "%s: %02x %02x %02x %02x %02x %02x %02x\n",
++		"write", buf[0], buf[1], buf[2], buf[3],
++		buf[4], buf[5], buf[6]);
++
++	result = mcp7940->write_block_data(mcp7940->client,
++		mcp7940->offset, 7, buf);
++	if (result < 0) {
++		dev_err(dev, "%s error %d\n", "write", result);
++		return result;
++	}
++	return 0;
++}
++
++static int ds1337_read_alarm(struct device *dev, struct rtc_wkalrm *t)
++{
++	struct i2c_client       *client = to_i2c_client(dev);
++	struct mcp7940		*mcp7940 = i2c_get_clientdata(client);
++	int			ret;
++
++	if (!test_bit(HAS_ALARM, &mcp7940->flags))
++		return -EINVAL;
++
++	/* read all ALARM1, ALARM2, and status registers at once */
++	ret = mcp7940->read_block_data(client,
++			DS1339_REG_ALARM1_SECS, 9, mcp7940->regs);
++	if (ret != 9) {
++		dev_err(dev, "%s error %d\n", "alarm read", ret);
++		return -EIO;
++	}
++
++	dev_dbg(dev, "%s: %02x %02x %02x %02x, %02x %02x %02x, %02x %02x\n",
++			"alarm read",
++			mcp7940->regs[0], mcp7940->regs[1],
++			mcp7940->regs[2], mcp7940->regs[3],
++			mcp7940->regs[4], mcp7940->regs[5],
++			mcp7940->regs[6], mcp7940->regs[7],
++			mcp7940->regs[8]);
++
++	/* report alarm time (ALARM1); assume 24 hour and day-of-month modes,
++	 * and that all four fields are checked matches
++	 */
++	t->time.tm_sec = bcd2bin(mcp7940->regs[0] & 0x7f);
++	t->time.tm_min = bcd2bin(mcp7940->regs[1] & 0x7f);
++	t->time.tm_hour = bcd2bin(mcp7940->regs[2] & 0x3f);
++	t->time.tm_mday = bcd2bin(mcp7940->regs[3] & 0x3f);
++	t->time.tm_mon = -1;
++	t->time.tm_year = -1;
++	t->time.tm_wday = -1;
++	t->time.tm_yday = -1;
++	t->time.tm_isdst = -1;
++
++	/* ... and status */
++	t->enabled = !!(mcp7940->regs[7] & DS1337_BIT_A1IE);
++	t->pending = !!(mcp7940->regs[8] & DS1337_BIT_A1I);
++
++	dev_dbg(dev, "%s secs=%d, mins=%d, "
++		"hours=%d, mday=%d, enabled=%d, pending=%d\n",
++		"alarm read", t->time.tm_sec, t->time.tm_min,
++		t->time.tm_hour, t->time.tm_mday,
++		t->enabled, t->pending);
++
++	return 0;
++}
++
++static int ds1337_set_alarm(struct device *dev, struct rtc_wkalrm *t)
++{
++	struct i2c_client       *client = to_i2c_client(dev);
++	struct mcp7940		*mcp7940 = i2c_get_clientdata(client);
++	unsigned char		*buf = mcp7940->regs;
++	u8			control, status;
++	int			ret;
++
++	if (!test_bit(HAS_ALARM, &mcp7940->flags))
++		return -EINVAL;
++
++	dev_dbg(dev, "%s secs=%d, mins=%d, "
++		"hours=%d, mday=%d, enabled=%d, pending=%d\n",
++		"alarm set", t->time.tm_sec, t->time.tm_min,
++		t->time.tm_hour, t->time.tm_mday,
++		t->enabled, t->pending);
++
++	/* read current status of both alarms and the chip */
++	ret = mcp7940->read_block_data(client,
++			DS1339_REG_ALARM1_SECS, 9, buf);
++	if (ret != 9) {
++		dev_err(dev, "%s error %d\n", "alarm write", ret);
++		return -EIO;
++	}
++	control = mcp7940->regs[7];
++	status = mcp7940->regs[8];
++
++	dev_dbg(dev, "%s: %02x %02x %02x %02x, %02x %02x %02x, %02x %02x\n",
++			"alarm set (old status)",
++			mcp7940->regs[0], mcp7940->regs[1],
++			mcp7940->regs[2], mcp7940->regs[3],
++			mcp7940->regs[4], mcp7940->regs[5],
++			mcp7940->regs[6], control, status);
++
++	/* set ALARM1, using 24 hour and day-of-month modes */
++	buf[0] = bin2bcd(t->time.tm_sec);
++	buf[1] = bin2bcd(t->time.tm_min);
++	buf[2] = bin2bcd(t->time.tm_hour);
++	buf[3] = bin2bcd(t->time.tm_mday);
++
++	/* set ALARM2 to non-garbage */
++	buf[4] = 0;
++	buf[5] = 0;
++	buf[6] = 0;
++
++	/* optionally enable ALARM1 */
++	buf[7] = control & ~(DS1337_BIT_A1IE | DS1337_BIT_A2IE);
++	if (t->enabled) {
++		dev_dbg(dev, "alarm IRQ armed\n");
++		buf[7] |= DS1337_BIT_A1IE;	/* only ALARM1 is used */
++	}
++	buf[8] = status & ~(DS1337_BIT_A1I | DS1337_BIT_A2I);
++
++	ret = mcp7940->write_block_data(client,
++			DS1339_REG_ALARM1_SECS, 9, buf);
++	if (ret < 0) {
++		dev_err(dev, "can't set alarm time\n");
++		return ret;
++	}
++
++	return 0;
++}
++
++static int mcp7940_ioctl(struct device *dev, unsigned int cmd, unsigned long arg)
++{
++	struct i2c_client	*client = to_i2c_client(dev);
++	struct mcp7940		*mcp7940 = i2c_get_clientdata(client);
++	int			ret;
++
++	switch (cmd) {
++	case RTC_AIE_OFF:
++		if (!test_bit(HAS_ALARM, &mcp7940->flags))
++			return -ENOTTY;
++
++		ret = i2c_smbus_read_byte_data(client, DS1337_REG_CONTROL);
++		if (ret < 0)
++			return ret;
++
++		ret &= ~DS1337_BIT_A1IE;
++
++		ret = i2c_smbus_write_byte_data(client,
++						DS1337_REG_CONTROL, ret);
++		if (ret < 0)
++			return ret;
++
++		break;
++
++	case RTC_AIE_ON:
++		if (!test_bit(HAS_ALARM, &mcp7940->flags))
++			return -ENOTTY;
++
++		ret = i2c_smbus_read_byte_data(client, DS1337_REG_CONTROL);
++		if (ret < 0)
++			return ret;
++
++		ret |= DS1337_BIT_A1IE;
++
++		ret = i2c_smbus_write_byte_data(client,
++						DS1337_REG_CONTROL, ret);
++		if (ret < 0)
++			return ret;
++
++		break;
++
++	default:
++		return -ENOIOCTLCMD;
++	}
++
++	return 0;
++}
++
++static const struct rtc_class_ops ds13xx_rtc_ops = {
++	.read_time	= mcp7940_get_time,
++	.set_time	= mcp7940_set_time,
++	.read_alarm	= ds1337_read_alarm,
++	.set_alarm	= ds1337_set_alarm,
++	.ioctl		= mcp7940_ioctl,
++};
++
++/*----------------------------------------------------------------------*/
++
++#define NVRAM_SIZE	56
++
++static ssize_t
++mcp7940_nvram_read(struct file *filp, struct kobject *kobj, struct bin_attribute *attr,
++		char *buf, loff_t off, size_t count)
++{
++	struct i2c_client	*client;
++	struct mcp7940		*mcp7940;
++	int			result;
++
++	client = kobj_to_i2c_client(kobj);
++	mcp7940 = i2c_get_clientdata(client);
++
++	if (unlikely(off >= NVRAM_SIZE))
++		return 0;
++	if ((off + count) > NVRAM_SIZE)
++		count = NVRAM_SIZE - off;
++	if (unlikely(!count))
++		return count;
++
++	result = mcp7940->read_block_data(client, 8 + off, count, buf);
++	if (result < 0)
++		dev_err(&client->dev, "%s error %d\n", "nvram read", result);
++	return result;
++}
++
++static ssize_t
++mcp7940_nvram_write(struct file *filp, struct kobject *kobj, struct bin_attribute *attr,
++		char *buf, loff_t off, size_t count)
++{
++	struct i2c_client	*client;
++	struct mcp7940		*mcp7940;
++	int			result;
++
++	client = kobj_to_i2c_client(kobj);
++	mcp7940 = i2c_get_clientdata(client);
++
++	if (unlikely(off >= NVRAM_SIZE))
++		return -EFBIG;
++	if ((off + count) > NVRAM_SIZE)
++		count = NVRAM_SIZE - off;
++	if (unlikely(!count))
++		return count;
++
++	result = mcp7940->write_block_data(client, 8 + off, count, buf);
++	if (result < 0) {
++		dev_err(&client->dev, "%s error %d\n", "nvram write", result);
++		return result;
++	}
++	return count;
++}
++
++static struct bin_attribute nvram = {
++	.attr = {
++		.name	= "nvram",
++		.mode	= S_IRUGO | S_IWUSR,
++	},
++
++	.read	= mcp7940_nvram_read,
++	.write	= mcp7940_nvram_write,
++	.size	= NVRAM_SIZE,
++};
++
++/*----------------------------------------------------------------------*/
++
++static struct i2c_driver mcp7940_driver;
++
++static int mcp7940_probe(struct i2c_client *client,
++				  const struct i2c_device_id *id)
++{
++	struct mcp7940		*mcp7940;
++	int			err = -ENODEV;
++	int			tmp;
++	struct i2c_adapter	*adapter = to_i2c_adapter(client->dev.parent);
++	unsigned char		*buf;
++
++	if (!i2c_check_functionality(adapter, I2C_FUNC_SMBUS_BYTE_DATA)
++	    && !i2c_check_functionality(adapter, I2C_FUNC_SMBUS_I2C_BLOCK))
++		return -EIO;
++
++	if (!(mcp7940 = kzalloc(sizeof(struct mcp7940), GFP_KERNEL)))
++		return -ENOMEM;
++
++	i2c_set_clientdata(client, mcp7940);
++
++	mcp7940->client	= client;
++	mcp7940->type	= id->driver_data;
++	mcp7940->offset	= 0;
++
++	buf = mcp7940->regs;
++	if (i2c_check_functionality(adapter, I2C_FUNC_SMBUS_I2C_BLOCK)) {
++		mcp7940->read_block_data = i2c_smbus_read_i2c_block_data;
++		mcp7940->write_block_data = i2c_smbus_write_i2c_block_data;
++	} else {
++		mcp7940->read_block_data = mcp7940_read_block_data;
++		mcp7940->write_block_data = mcp7940_write_block_data;
++	}
++
++read_rtc:
++	/* read RTC registers */
++	tmp = mcp7940->read_block_data(mcp7940->client, 0, 8, buf);
++	if (tmp != 8) {
++		pr_debug("read error %d\n", tmp);
++		err = -EIO;
++		goto exit_free;
++	}
++
++	/* minimal sanity checking; some chips (like DS1340) don't
++	 * specify the extra bits as must-be-zero, but there are
++	 * still a few values that are clearly out-of-range.
++	 */
++	tmp = mcp7940->regs[MCP7940_REG_SECS];
++
++
++		/* make sure that the backup battery is enabled */
++		if (!(mcp7940->regs[MCP7940_REG_WDAY] & MCP7940_BIT_VBATEN)) {
++			i2c_smbus_write_byte_data(client, MCP7940_REG_WDAY,
++				mcp7940->regs[MCP7940_REG_WDAY]
++				| MCP7940_BIT_VBATEN);
++		}
++
++		/* clock halted?  turn it on, so clock can tick. */
++		if (!(tmp & MCP7940_BIT_ST)) {
++			i2c_smbus_write_byte_data(client, MCP7940_REG_SECS,
++				MCP7940_BIT_ST);
++			dev_warn(&client->dev, "SET TIME!\n");
++			goto read_rtc;
++		}
++
++
++	tmp = mcp7940->regs[MCP7940_REG_HOUR];
++	switch (mcp7940->type) {
++	default:
++		if (!(tmp & MCP7940_BIT_12HR))
++			break;
++
++		/* Be sure we're in 24 hour mode.  Multi-master systems
++		 * take note...
++		 */
++		tmp = bcd2bin(tmp & 0x1f);
++		if (tmp == 12)
++			tmp = 0;
++		if (mcp7940->regs[MCP7940_REG_HOUR] & MCP7940_BIT_PM)
++			tmp += 12;
++		i2c_smbus_write_byte_data(client,
++				MCP7940_REG_HOUR,
++				bin2bcd(tmp));
++	}
++
++	mcp7940->rtc = rtc_device_register(client->name, &client->dev,
++				&ds13xx_rtc_ops, THIS_MODULE);
++	if (IS_ERR(mcp7940->rtc)) {
++		err = PTR_ERR(mcp7940->rtc);
++		dev_err(&client->dev,
++			"unable to register the class device\n");
++		goto exit_free;
++	}
++
++	return 0;
++
++	rtc_device_unregister(mcp7940->rtc);
++exit_free:
++	kfree(mcp7940);
++	return err;
++}
++
++static struct i2c_driver mcp7940_driver = {
++	.driver = {
++		.name	= "rtc-mcp7940",
++		.owner	= THIS_MODULE,
++	},
++	.probe		= mcp7940_probe,
++	.id_table	= mcp7940_id,
++};
++
++module_i2c_driver(mcp7940_driver);
++
++MODULE_DESCRIPTION("RTC driver for MCP7940 and similar chips");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/video/Kconfig b/drivers/video/Kconfig
+index dade5b7..617e1da 100644
+--- a/drivers/video/Kconfig
++++ b/drivers/video/Kconfig
+@@ -1018,6 +1018,21 @@ config FB_ATMEL
+ 	help
+ 	  This enables support for the AT91/AT32 LCD Controller.
+ 
++config FB_AXENT
++	tristate "Axent LEDFB support"
++	depends on FB
++	select FB_CFB_FILLRECT
++	select FB_CFB_COPYAREA
++	select FB_CFB_IMAGEBLIT
++	help
++	  This enables support for the Axent LEDFB FPGA Core.
++
++config FB_AXENT_MON
++	tristate "Axent LEDMON support"
++	depends on FB
++	help
++	  This enables support for the Axent LED Monitor FPGA Core.
++
+ config FB_INTSRAM
+ 	bool "Frame Buffer in internal SRAM"
+ 	depends on FB_ATMEL && ARCH_AT91SAM9261
+diff --git a/drivers/video/Makefile b/drivers/video/Makefile
+index ae17ddf..d345da2 100644
+--- a/drivers/video/Makefile
++++ b/drivers/video/Makefile
+@@ -96,6 +96,8 @@ obj-$(CONFIG_FB_EP93XX)		  += ep93xx-fb.o
+ obj-$(CONFIG_FB_SA1100)           += sa1100fb.o
+ obj-$(CONFIG_FB_HIT)              += hitfb.o
+ obj-$(CONFIG_FB_ATMEL)		  += atmel_lcdfb.o
++obj-$(CONFIG_FB_AXENT)		  += axent_ledfb.o
++obj-$(CONFIG_FB_AXENT_MON)		  += axent_ledmon.o
+ obj-$(CONFIG_FB_PVR2)             += pvr2fb.o
+ obj-$(CONFIG_FB_VOODOO1)          += sstfb.o
+ obj-$(CONFIG_FB_ARMCLCD)	  += amba-clcd.o
+diff --git a/drivers/video/axent_ledfb.c b/drivers/video/axent_ledfb.c
+new file mode 100644
+index 0000000..e15482c
+--- /dev/null
++++ b/drivers/video/axent_ledfb.c
+@@ -0,0 +1,1048 @@
++/*
++ *	Driver for Axent LED Display Controller
++ *
++ *	(C) Copyright 2011-2014 Axent Global
++ *
++ *	By Daniel Dyer, Axent Global, daniel_dyer@axent.com.au.
++ */
++
++#include <linux/platform_device.h>
++#include <linux/kernel.h>
++#include <linux/interrupt.h>
++#include <linux/clk.h>
++#include <linux/fb.h>
++#include <linux/init.h>
++#include <linux/delay.h>
++#include <linux/module.h>
++#include <linux/errno.h>
++#include <linux/string.h>
++#include <linux/ioport.h>
++#include <linux/mm.h>
++#include <linux/slab.h>
++#include <linux/log2.h>
++#include <linux/of.h>
++
++#include <asm/uaccess.h>
++#include <asm/io.h>
++#include <asm/byteorder.h>
++
++#include <video/axent_ledfb.h>
++
++#define AXENT_LEDFB_DRIVER_NAME	"axent_ledfb"
++
++static ssize_t axent_ledfb_run_command(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
++{
++	struct fb_info *info = dev_get_drvdata(dev);
++	struct axent_ledfb_info *sinfo = info->par;
++	int value;
++	
++	value = simple_strtol(buf, NULL, 0);
++	
++	// Set command mode
++	iowrite32(value & 0x03, sinfo->regs + AXENT_LEDFB_CMDMODE);
++	udelay(10);
++	
++	// Run command
++	iowrite32(AXENT_LEDFB_START | AXENT_LEDFB_UNBLANK | AXENT_LEDFB_CMD, sinfo->regs + AXENT_LEDFB_CR);
++	
++	return count;
++}
++
++static ssize_t axent_ledfb_set_config(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
++{
++	struct fb_info *info = dev_get_drvdata(dev);
++	struct axent_ledfb_info *sinfo = info->par;
++	int value;
++	
++	value = simple_strtol(buf, NULL, 0);
++	
++	iowrite32(value & 0xffff, sinfo->regs + AXENT_LEDFB_CFG);
++	udelay(10);
++	
++	// Set command mode
++	iowrite32(4, sinfo->regs + AXENT_LEDFB_CMDMODE);
++	udelay(10);
++	
++	// Run command
++	iowrite32(AXENT_LEDFB_START | AXENT_LEDFB_UNBLANK | AXENT_LEDFB_CMD, sinfo->regs + AXENT_LEDFB_CR);
++	
++	return count;
++}
++
++static ssize_t axent_ledfb_get_config(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	struct fb_info *info = dev_get_drvdata(dev);
++	struct axent_ledfb_info *sinfo = info->par;
++	int cfg;
++	
++	cfg = ioread32(sinfo->regs + AXENT_LEDFB_CFG) & 0xffff;
++	
++	return sprintf(buf, "%d\n", cfg);
++}
++
++static DEVICE_ATTR(command, 0222, NULL, axent_ledfb_run_command);
++static DEVICE_ATTR(config, 0644, axent_ledfb_get_config, axent_ledfb_set_config);
++
++static struct fb_fix_screeninfo axent_ledfb_fix __initdata = {
++	.id			= "Axent LEDFB",
++	.type		= FB_TYPE_PACKED_PIXELS,
++	.visual		= FB_VISUAL_TRUECOLOR,
++	.xpanstep	= 0,
++	.ypanstep	= 0,
++	.ywrapstep	= 0,
++	.accel		= FB_ACCEL_NONE,
++};
++
++/**
++ *      xxxfb_check_var - Optional function. Validates a var passed in. 
++ *      @var: frame buffer variable screen structure
++ *      @info: frame buffer structure that represents a single frame buffer 
++ *
++ *	Checks to see if the hardware supports the state requested by
++ *	var passed in. This function does not alter the hardware state!!! 
++ *	This means the data stored in struct fb_info and struct xxx_par do 
++ *      not change. This includes the var inside of struct fb_info. 
++ *	Do NOT change these. This function can be called on its own if we
++ *	intent to only test a mode and not actually set it. The stuff in 
++ *	modedb.c is a example of this. If the var passed in is slightly 
++ *	off by what the hardware can support then we alter the var PASSED in
++ *	to what we can do.
++ *
++ *      For values that are off, this function must round them _up_ to the
++ *      next value that is supported by the hardware.  If the value is
++ *      greater than the highest value supported by the hardware, then this
++ *      function must return -EINVAL.
++ *
++ *      Exception to the above rule:  Some drivers have a fixed mode, ie,
++ *      the hardware is already set at boot up, and cannot be changed.  In
++ *      this case, it is more acceptable that this function just return
++ *      a copy of the currently working var (info->var). Better is to not
++ *      implement this function, as the upper layer will do the copying
++ *      of the current var for you.
++ *
++ *      Note:  This is the only function where the contents of var can be
++ *      freely adjusted after the driver has been registered. If you find
++ *      that you have code outside of this function that alters the content
++ *      of var, then you are doing something wrong.  Note also that the
++ *      contents of info->var must be left untouched at all times after
++ *      driver registration.
++ *
++ *	Returns negative errno on error, or zero on success.
++ */
++
++static int axent_ledfb_check_var(struct fb_var_screeninfo *var, struct fb_info *info)
++{
++	struct device *dev = info->device;
++	struct axent_ledfb_info *sinfo = info->par;
++	struct led_module *cur;
++	u8 channel_max = 0;
++	u16 x_max = 0;
++	u16 y_max = 0;
++	u16 index_max = 0;
++	u32 max_framerate;
++	
++	dev_dbg(dev, "  resolution:	%ux%u\n", var->xres, var->yres);
++	dev_dbg(dev, "  pixclk:	    %lu kHz\n", PICOS2KHZ(var->pixclock));
++	dev_dbg(dev, "  bpp:		%u\n", var->bits_per_pixel);
++	
++	// Check for invalid rotations
++	switch(var->rotate)
++	{
++		case 0:
++		case 180:
++			break;
++		default:
++			var->rotate = 0;
++	}
++	
++	// Do not allow to have real resoulution larger than virtual
++	if(var->xres > var->xres_virtual)
++		var->xres_virtual = var->xres;
++	
++	if(var->yres > var->yres_virtual)
++		var->yres_virtual = var->yres;
++	
++	// Ensure dimensions aren't zero.
++	if(var->xres_virtual == 0)
++	    var->xres_virtual = 1;
++    if(var->yres_virtual == 0)
++	    var->yres_virtual = 1;
++    if(var->xres == 0)
++	    var->xres = 1;
++    if(var->yres == 0)
++	    var->yres = 1;
++	
++	var->xoffset = var->yoffset = 0;
++	
++	// XXX: REVISIT
++	var->pixclock = (__u32)KHZ2PICOS(10000);
++	
++	// Set maximum superchannel indices to zero initially.
++	memset(sinfo->superchannel_index_max, 0x00, (size_t)256);
++	
++	// Calculate required pixels per channel based on resolution and module info/connect parameters
++	list_for_each_entry(cur, &sinfo->module_list, list)
++	{
++		if(cur->index > index_max)
++			index_max = cur->index;
++		
++		if(cur->index > sinfo->superchannel_index_max[cur->superchannel])
++			sinfo->superchannel_index_max[cur->superchannel] = cur->index;
++		
++		if(cur->pos_x > x_max)
++			x_max = cur->pos_x;
++		
++		if(cur->pos_y > y_max)
++			y_max = cur->pos_y;
++		
++		if(cur->superchannel > channel_max)
++			channel_max = cur->superchannel;
++	}
++	
++	// Check that the superchannel numbers are within bounds (total channels / channels per module)
++	if(sinfo->module_info.channels > 0)
++	{
++		if(channel_max >= (ioread32(sinfo->regs + AXENT_LEDFB_CH) / sinfo->module_info.channels))
++		{
++			dev_err(dev, "cannot support %d superchannels with \
++						  %d channels per module and %d channels available\n", channel_max,
++						  sinfo->module_info.channels,
++						  ioread32(sinfo->regs + AXENT_LEDFB_CH));
++			return -EINVAL;
++		}
++	}
++	else
++	{
++		dev_err(dev, "module info not yet set\n");
++		return -EINVAL;
++	}
++	
++	dev_dbg(dev, "channel offset: %u\n", ioread32(sinfo->regs + AXENT_LEDFB_COFF));
++	
++	// Using the highest index, calculate number of pixels per channel per module and multiply together to get pixels/channel
++	sinfo->pixels_per_channel = ((sinfo->module_info.res_y * sinfo->module_info.res_x) / sinfo->module_info.channels) * (index_max + 1);
++	
++	// Check to make sure number of pixels per channel isn't above the maximum
++	if(sinfo->pixels_per_channel > ioread32(sinfo->regs + AXENT_LEDFB_PXMAX))
++	{
++		dev_err(dev, "%u pixels per channel too high for this configuration\n", sinfo->pixels_per_channel);
++		return -EINVAL;
++	}
++	
++	dev_dbg(dev, "pixels per channel: %u\n", sinfo->pixels_per_channel);
++	
++	// Need to have at least 1 scan line
++	if(!(sinfo->module_info.scan_lines > 0))
++	{
++		dev_dbg(dev, "no scan lines set for module\n");
++		return -EINVAL;
++	}
++	
++	// Round scan line settings
++	if(!is_power_of_2(sinfo->module_info.scan_lines))
++	{
++		sinfo->module_info.scan_lines = rounddown_pow_of_two(sinfo->module_info.scan_lines);
++		dev_dbg(dev, "rounded scan lines to %d\n", sinfo->module_info.scan_lines);
++	}
++	
++	// Using the highest y start position, add the module vertical resolution and use to check y res in var
++	if(var->yres < (y_max + sinfo->module_info.res_y))
++	{
++		dev_dbg(dev, "y resolution below minimum specified by module layout\n");
++		return -EINVAL;
++	}
++	
++	// Using the highest x start position, add the module horizontal resolution and use to check x res in var
++	if(var->xres < (x_max + sinfo->module_info.res_x))
++	{
++		dev_dbg(dev, "x resolution below minimum specified by module layout\n");
++		return -EINVAL;
++	}
++	
++	// Also check to make sure x and y resolutions aren't too high (based purely on sinfo->map_len)
++	if(4 * (var->xres * var->yres) > sinfo->map_len)
++	{
++		dev_err(dev, "resolution too high to fit pixel map in space allocated\n");
++		return -EINVAL;
++	}
++	
++	// Check bits per pixel (don't handle truncated modes here, offsets always stay the same)
++	if(var->bits_per_pixel == 32)
++	{
++		var->red.offset = 16;
++		var->green.offset = 8;
++		var->blue.offset = 0;
++		var->red.length = var->green.length = var->blue.length = 8;
++		var->transp.offset = var->transp.length = 0;
++	}
++	else
++	{
++		dev_err(dev, "color depth %d not supported\n", var->bits_per_pixel);
++		return -EINVAL;
++	}
++	
++	// Calculate maximum framerate based on pixel clock, colour depth and pixels per channel
++	max_framerate = (PICOS2KHZ(var->pixclock) * 1000 * 10) / (sinfo->pixels_per_channel * (1 << ioread32(sinfo->regs + AXENT_LEDFB_CDEPTH)));
++	dev_dbg(dev, "maximum framerate for this resolution: %d.%d fps\n", max_framerate/10, max_framerate%10);
++	
++	return 0;
++}
++
++/**
++ *      xxxfb_set_par - Optional function. Alters the hardware state.
++ *      @info: frame buffer structure that represents a single frame buffer
++ *
++ *	Using the fb_var_screeninfo in fb_info we set the resolution of the
++ *	this particular framebuffer. This function alters the par AND the
++ *	fb_fix_screeninfo stored in fb_info. It doesn't not alter var in 
++ *	fb_info since we are using that data. This means we depend on the
++ *	data in var inside fb_info to be supported by the hardware. 
++ *
++ *      This function is also used to recover/restore the hardware to a
++ *      known working state.
++ *
++ *	xxxfb_check_var is always called before xxxfb_set_par to ensure that
++ *      the contents of var is always valid.
++ *
++ *	Again if you can't change the resolution you don't need this function.
++ *
++ *      However, even if your hardware does not support mode changing,
++ *      a set_par might be needed to at least initialize the hardware to
++ *      a known working state, especially if it came back from another
++ *      process that also modifies the same hardware, such as X.
++ *
++ *      If this is the case, a combination such as the following should work:
++ *
++ *      static int xxxfb_check_var(struct fb_var_screeninfo *var,
++ *                                struct fb_info *info)
++ *      {
++ *              *var = info->var;
++ *              return 0;
++ *      }
++ *
++ *      static int xxxfb_set_par(struct fb_info *info)
++ *      {
++ *              init your hardware here
++ *      }
++ *
++ *	Returns negative errno on error, or zero on success.
++ */
++ 
++static int axent_ledfb_set_par(struct fb_info *info)
++{
++	struct fb_var_screeninfo *var = &info->var;
++	struct axent_ledfb_info *sinfo = info->par;
++	struct led_module_info *minfo = &sinfo->module_info;
++	struct led_module *cur;
++	u32 source_addr, channel_offset, i, c, l, target_addr, max_index, bits_per_line, temp_x, temp_y;
++
++	// Disable the display but don't issue a software reset (need to keep things like brightness and OE divisor values)
++	iowrite32(0, sinfo->regs + AXENT_LEDFB_CR);
++	
++	// Set pixels per channel setting stored in sinfo
++	iowrite32(sinfo->pixels_per_channel, sinfo->regs + AXENT_LEDFB_PX);
++	
++	// Set scan lines from values in module info
++	iowrite32(ilog2(sinfo->module_info.scan_lines), sinfo->regs + AXENT_LEDFB_SCAN);
++	
++	bits_per_line = info->var.xres_virtual * info->var.bits_per_pixel;
++	info->fix.line_length = DIV_ROUND_UP(bits_per_line, 8);
++	
++	max_index = (sinfo->pixels_per_channel - 1) / ((minfo->res_y * minfo->res_x) / minfo->channels);
++	channel_offset = ioread32(sinfo->regs + AXENT_LEDFB_COFF);
++	
++	// Initialise the pixel map.
++	for(i = 0; i < sinfo->map_len>>2; i++)
++		iowrite32(0xffffffff, sinfo->map + (i<<2));
++	
++	list_for_each_entry(cur, &sinfo->module_list, list)
++	{
++		for(l = 0; l < minfo->scan_lines; l++)
++		{
++			for(c = 0; c < minfo->channels; c++)
++			{
++				for(i = 0; i < (((minfo->res_x * minfo->res_y) / minfo->channels) / minfo->scan_lines); i++)
++				{
++					// Calculate target address
++					target_addr = channel_offset * ((cur->superchannel * minfo->channels) + c)
++								+ (cur->index + max_index - sinfo->superchannel_index_max[cur->superchannel])
++								* (minfo->res_x * (minfo->res_y / (minfo->scan_lines * minfo->channels)))
++								+ l * (minfo->res_x * (minfo->res_y / (minfo->scan_lines * minfo->channels)) * (max_index + 1))
++								+ i;
++					
++					// Calculate source address
++					temp_x = ((minfo->res_x - 1) - (minfo->pattern[c][i] % minfo->res_x)) + (var->xres - minfo->res_x - cur->pos_x);
++					temp_y = ((var->yres - minfo->res_y - cur->pos_y) + (minfo->pattern[c][i] / minfo->res_x) * minfo->scan_lines + l);
++					
++					if(var->rotate == 180)
++					{
++						temp_x = var->xres - temp_x - 1;
++						temp_y = var->yres - temp_y - 1;
++					}
++					
++					source_addr = (var->xres * temp_y) + temp_x;
++					
++					// Store the mapping to the pixel map (but only if it's in bounds)
++					if((source_addr<<2) <= sinfo->map_len)
++						iowrite32(target_addr, sinfo->map + (source_addr<<2));
++				}
++			}
++		}
++	}
++	
++	// Re-enable the display (this restarts the state machine and re-enables the OE line)
++	iowrite32(AXENT_LEDFB_START | AXENT_LEDFB_UNBLANK, sinfo->regs + AXENT_LEDFB_CR);
++
++	return 0;	
++}
++
++static inline unsigned int chan_to_field(unsigned int chan, const struct fb_bitfield *bf)
++{
++	chan &= 0xffff;
++	chan >>= 16 - bf->length;
++	return chan << bf->offset;
++}
++
++/* Set rotate (0, 90, 180, 270 degrees), calculate the new pixel map and switch to the new mode. */
++static void axent_ledfb_rotate(struct fb_info *info, int rotate)
++{
++	struct fb_var_screeninfo *var = &info->var;
++	
++	var->rotate = rotate;
++	fb_set_var(info, var);
++}
++
++static int axent_ledfb_setcmap(struct fb_cmap *cmap, struct fb_info *info)
++{
++	struct axent_ledfb_info *sinfo = info->par;
++	int i = 0;
++	
++	// Set CLUTs all in one batch from the cmap struct
++	for(i = 0; i < cmap->len; i++)
++	{
++		iowrite32(chan_to_field(cmap->red[i], &info->var.red) |
++				  chan_to_field(cmap->green[i], &info->var.green) |
++				  chan_to_field(cmap->blue[i], &info->var.blue),
++				  (u32*)sinfo->clut + i);
++	}
++	
++	return 0;
++}
++
++/**
++ *  	axent_lcdfb_setcolreg - Optional function. Sets a color register.
++ *      @regno: Which register in the CLUT we are programming
++ *      @red: The red value which can be up to 16 bits wide
++ *	@green: The green value which can be up to 16 bits wide
++ *	@blue:  The blue value which can be up to 16 bits wide.
++ *	@transp: If supported the alpha value which can be up to 16 bits wide.
++ *      @info: frame buffer info structure
++ *
++ *  	Set a single color register. The values supplied have a 16 bit
++ *  	magnitude which needs to be scaled in this function for the hardware.
++ *	Things to take into consideration are how many color registers, if
++ *	any, are supported with the current color visual. With truecolor mode
++ *	no color palettes are supported. Here a pseudo palette is created
++ *	which we store the value in pseudo_palette in struct fb_info. For
++ *	pseudocolor mode we have a limited color palette. To deal with this
++ *	we can program what color is displayed for a particular pixel value.
++ *	DirectColor is similar in that we can program each color field. If
++ *	we have a static colormap we don't need to implement this function.
++ *
++ *	Returns negative errno on error, or zero on success. In an
++ *	ideal world, this would have been the case, but as it turns
++ *	out, the other drivers return 1 on failure, so that's what
++ *	we're going to do.
++ */
++static int axent_ledfb_setcolreg(unsigned int regno, unsigned int red,
++			     unsigned int green, unsigned int blue,
++			     unsigned int transp, struct fb_info *info)
++{
++	struct axent_ledfb_info *sinfo = info->par;
++	unsigned int val;
++	u32 *pal;
++	int ret = 1;
++
++	if (info->var.grayscale)
++		red = green = blue = (19595 * red + 38470 * green
++				      + 7471 * blue) >> 16;
++
++	switch (info->fix.visual) {
++	case FB_VISUAL_TRUECOLOR:
++		if (regno < 16) {
++			pal = info->pseudo_palette;
++
++			val  = chan_to_field(red, &info->var.red);
++			val |= chan_to_field(green, &info->var.green);
++			val |= chan_to_field(blue, &info->var.blue);
++
++			pal[regno] = val;
++			ret = 0;
++		}
++		break;
++
++	case FB_VISUAL_PSEUDOCOLOR:
++		if (regno < 256) {
++			val  = chan_to_field(red, &info->var.red);
++			val |= chan_to_field(green, &info->var.green);
++			val |= chan_to_field(blue, &info->var.blue);
++			
++			iowrite32(val, (u32*)sinfo->clut + regno);
++			ret = 0;
++		}
++		break;
++
++	case FB_VISUAL_MONO01:
++		if (regno < 2) {
++			val = (regno == 0) ? 0x00000000 : 0xffffffff;
++			iowrite32(val, (u32*)sinfo->clut + regno);
++			ret = 0;
++		}
++		break;
++
++	}
++
++	return ret;
++}
++
++/**
++ *      xxxfb_blank - NOT a required function. Blanks the display.
++ *      @blank_mode: the blank mode we want. 
++ *      @info: frame buffer structure that represents a single frame buffer
++ *
++ *      Blank the screen if blank_mode != FB_BLANK_UNBLANK, else unblank.
++ *      Return 0 if blanking succeeded, != 0 if un-/blanking failed due to
++ *      e.g. a video mode which doesn't support it.
++ *
++ *      Implements VESA suspend and powerdown modes on hardware that supports
++ *      disabling hsync/vsync:
++ *
++ *      FB_BLANK_NORMAL = display is blanked, syncs are on.
++ *      FB_BLANK_HSYNC_SUSPEND = hsync off
++ *      FB_BLANK_VSYNC_SUSPEND = vsync off
++ *      FB_BLANK_POWERDOWN =  hsync and vsync off
++ *
++ *      If implementing this function, at least support FB_BLANK_UNBLANK.
++ *      Return !0 for any modes that are unimplemented.
++ *
++ */
++static int axent_ledfb_blank(int blank_mode, struct fb_info *info)
++{
++	struct axent_ledfb_info *sinfo = info->par;
++
++	if(blank_mode != FB_BLANK_UNBLANK)
++	{
++		// Disable the display but don't issue a software reset (need to keep things like brightness and OE divisor values)
++		iowrite32(0, sinfo->regs + AXENT_LEDFB_CR);
++	}
++	else
++	{
++		// Re-enable the display (this restarts the state machine and re-enables the OE line)
++		iowrite32(AXENT_LEDFB_START | AXENT_LEDFB_UNBLANK, sinfo->regs + AXENT_LEDFB_CR);
++	}
++	
++	return 0;
++}
++
++static int axent_ledfb_ioctl(struct fb_info *info, unsigned int cmd, unsigned long arg)
++{
++	struct device *dev = info->device;
++	struct axent_ledfb_info *sinfo = info->par;
++	struct led_module *cur, *new_module, *next_module;
++	struct led_module_info_user *new_module_info;
++	struct led_module_pattern *new_module_pattern;
++	void __user *argp = (void __user *)arg;
++	int i, val;
++	int ret = 0;
++	
++	switch(cmd)
++	{
++		case AXENT_LEDFB_IOCTL_SET_MODULE_INFO:
++			// Populate module_info struct from arg here
++			new_module_info = memdup_user(argp, sizeof(struct led_module_info_user));
++			if(!new_module_info)
++				return -EFAULT;
++			
++			sinfo->module_info.res_x = new_module_info->res_x;
++			sinfo->module_info.res_y = new_module_info->res_y;
++			sinfo->module_info.channels = new_module_info->channels;
++			sinfo->module_info.scan_lines = new_module_info->scan_lines;
++			kfree(new_module_info);
++			
++	        dev_dbg(dev, "module information:\n");
++	        dev_dbg(dev, "\tres_x = %d\n", sinfo->module_info.res_x);
++	        dev_dbg(dev, "\tres_y = %d\n", sinfo->module_info.res_y);
++	        dev_dbg(dev, "\tchannels = %d\n", sinfo->module_info.channels);
++	        dev_dbg(dev, "\tscan_lines = %d\n", sinfo->module_info.scan_lines);
++	        
++			break;
++			
++		case AXENT_LEDFB_IOCTL_SET_MODULE_PATTERN:
++		    // Receive clocking pattern from user
++			new_module_pattern = memdup_user(argp, sizeof(struct led_module_pattern));
++			if(!new_module_pattern)
++				return -EFAULT;
++			
++			for(i = 0; i < 511; i++)
++				sinfo->module_info.pattern[new_module_pattern->channel][i] = new_module_pattern->pattern[i];
++				
++			kfree(new_module_pattern);
++			
++			break;
++	    
++		case AXENT_LEDFB_IOCTL_ADD_MODULE:
++			new_module = kzalloc(sizeof(struct led_module), GFP_KERNEL);
++			if(!new_module)
++				return -ENOMEM;
++			
++			// Populate module struct from arg here
++			if(copy_from_user(&new_module->superchannel, argp, sizeof(struct led_module_user)))
++			    return -EFAULT;
++			
++			list_add_tail(&new_module->list, &sinfo->module_list);
++			
++	        dev_dbg(dev, "added new module:\n");
++	        dev_dbg(dev, "\tsuperchannel = %d\n", new_module->superchannel);
++	        dev_dbg(dev, "\tindex = %d\n", new_module->index);
++	        dev_dbg(dev, "\tpos_x = %d\n", new_module->pos_x);
++	        dev_dbg(dev, "\tpos_y = %d\n", new_module->pos_y);
++	        
++			break;
++		
++		case AXENT_LEDFB_IOCTL_RESET_MODULE_LIST:
++			// Delete all modules from the list and free them
++			list_for_each_entry_safe(cur, next_module, &sinfo->module_list, list)
++			{
++				list_del(&cur->list);
++				kfree(cur);
++			}
++			
++			break;
++		
++		case AXENT_LEDFB_IOCTL_SET_BRIGHTNESS:
++			// Set the display brightness register
++			if(copy_from_user(&val, argp, sizeof(int)))
++			    return -EFAULT;
++			
++			dev_dbg(dev, "set brightness = %d\n", val);
++
++			iowrite32(val, sinfo->regs + AXENT_LEDFB_BR);
++
++			break;
++		
++		case AXENT_LEDFB_IOCTL_GET_BRIGHTNESS:
++			// Return the display brightness register
++			val = ioread32(sinfo->regs + AXENT_LEDFB_BR);
++			
++			ret = copy_to_user(argp, &val, sizeof(int)) ? -EFAULT : 0;
++			
++			break;
++		
++		case AXENT_LEDFB_IOCTL_SET_OEFREQ:
++			// Set the OE system clock divisor to adjust the OE fundamental frequency
++			if(copy_from_user(&val, argp, sizeof(int)))
++			    return -EFAULT;
++			
++			dev_dbg(dev, "set oefreq = %d\n", val);
++			
++			// XXX: REVISIT
++			iowrite32(5, sinfo->regs + AXENT_LEDFB_OEDIV);
++			
++			break;
++			
++		case AXENT_LEDFB_IOCTL_SET_COLOURS:
++	        // Set colour depth truncate value
++			if(copy_from_user(&val, argp, sizeof(int)))
++			    return -EFAULT;
++			    
++			if((val > 0) && (val <= 8))
++			{
++			    iowrite32(val, sinfo->regs + AXENT_LEDFB_CDEPTH);
++			    dev_dbg(dev, "set colour depth = %d\n", val);
++	        }
++			else
++			{
++				dev_err(dev, "%d is an invalid value for colour depth\n", val);
++				return -EINVAL;
++			}
++			
++			break;
++		
++		case AXENT_LEDFB_IOCTL_SET_CONFIGURATION:
++		    // Set driver configuration word
++	        if(copy_from_user(&val, argp, sizeof(int)))
++		        return -EFAULT;
++			
++	        iowrite32(val & 0xffff, sinfo->regs + AXENT_LEDFB_CFG);
++            udelay(10);
++			
++            // Set command mode
++            iowrite32(4, sinfo->regs + AXENT_LEDFB_CMDMODE);
++            udelay(10);
++			
++            // Run command
++            iowrite32(AXENT_LEDFB_START | AXENT_LEDFB_UNBLANK | AXENT_LEDFB_CMD, sinfo->regs + AXENT_LEDFB_CR);
++		    
++		    break;
++	    
++		case AXENT_LEDFB_IOCTL_REQUEST_ERROR_DATA:
++			// Request an LED error data update
++			// Set command mode for temperature
++			iowrite32(3, sinfo->regs + AXENT_LEDFB_CMDMODE);
++			udelay(10);
++
++			// Run command
++			val = ioread32(sinfo->regs + AXENT_LEDFB_CR);
++			iowrite32(AXENT_LEDFB_START | (val & AXENT_LEDFB_UNBLANK) | AXENT_LEDFB_CMD, sinfo->regs + AXENT_LEDFB_CR);
++
++			// Wait a while for the command to execute
++			mdelay(10);
++			
++			// Then trigger OCD and SCD requests for each scanline.
++			for(i = 0; i < sinfo->module_info.scan_lines; i++) {
++				// Set scanline
++				iowrite32(i, sinfo->regs + AXENT_LEDFB_CMDSCAN);
++		
++				// Set OCD command mode
++				iowrite32(1, sinfo->regs + AXENT_LEDFB_CMDMODE);
++				udelay(10);
++		
++				// Run command
++				iowrite32(AXENT_LEDFB_START | (val & AXENT_LEDFB_UNBLANK) | AXENT_LEDFB_CMD, sinfo->regs + AXENT_LEDFB_CR);
++			
++				// Wait a while for the command to execute
++				mdelay(10);
++				
++				// Set SCD command mode
++				iowrite32(2, sinfo->regs + AXENT_LEDFB_CMDMODE);
++				udelay(10);
++		
++				// Run command
++				iowrite32(AXENT_LEDFB_START | (val & AXENT_LEDFB_UNBLANK) | AXENT_LEDFB_CMD, sinfo->regs + AXENT_LEDFB_CR);
++			
++				// Wait a while for the command to execute
++				mdelay(10);
++			}
++
++			// Return to previous mode
++			iowrite32(val, sinfo->regs + AXENT_LEDFB_CR);
++			
++			// Reset command scan
++			iowrite32(0, sinfo->regs + AXENT_LEDFB_CMDSCAN);
++			
++			break;
++	}
++	
++	return ret;
++}
++
++// Framebuffer operations - read(), write() and mmap() are provided by fbmem.c
++static struct fb_ops axent_ledfb_ops = {
++	.owner			= THIS_MODULE,
++	.fb_check_var	= axent_ledfb_check_var,
++	.fb_set_par		= axent_ledfb_set_par,
++	.fb_setcmap		= axent_ledfb_setcmap,
++	.fb_setcolreg	= axent_ledfb_setcolreg,
++	.fb_blank		= axent_ledfb_blank,
++	.fb_fillrect	= cfb_fillrect,
++	.fb_copyarea	= cfb_copyarea,
++	.fb_imageblit	= cfb_imageblit,
++	.fb_ioctl		= axent_ledfb_ioctl,
++	.fb_rotate		= axent_ledfb_rotate,
++};
++
++static int axent_ledfb_probe(struct platform_device *dev)
++{
++	struct device *device = &dev->dev;
++	struct fb_info *info;
++	struct axent_ledfb_info *sinfo;
++	struct resource *regs, *frame, *map, *clut;
++	int ret;
++	
++	// Allocate memory for the info struct
++	info = framebuffer_alloc(sizeof(struct axent_ledfb_info), device);
++	if(!info)
++	{
++		dev_err(device, "cannot allocate memory for framebuffer info\n");
++		ret = -ENOMEM;
++		goto error_alloc;
++	}
++	
++	sinfo = info->par;
++	
++	INIT_LIST_HEAD(&info->modelist);
++	
++	INIT_LIST_HEAD(&sinfo->module_list);
++	
++	// NOTE: Before the display can actually be used, we'll have to setup module info, module list and video mode
++	
++	info->fbops = &axent_ledfb_ops;
++	info->pseudo_palette = sinfo->pseudo_palette;
++	info->flags = FBINFO_DEFAULT;
++	info->fix = axent_ledfb_fix;
++	
++	// Set up initial var
++	info->var.bits_per_pixel = 32;
++	axent_ledfb_check_var(&info->var, info);
++	
++	// Allocate cmap memory
++	ret = fb_alloc_cmap(&info->cmap, 256, 0);
++	if (ret < 0)
++	{
++		dev_err(device, "unable to allocate cmap memory\n");
++		goto error_alloc_cmap;
++	}
++	
++	// Check to make sure the device has the required number of resources
++	// TODO: Add support for an IRQ which could do something like hardware test modes (on boards which have the rotary switch wired to the FPGA)
++	if(dev->num_resources < 4)
++	{
++		dev_err(device, "framebuffer device has incorrect number of resources\n");
++		ret = -EINVAL;
++		goto error_resources;
++	}
++	
++	// Request and map device register memory
++	regs = platform_get_resource(dev, IORESOURCE_MEM, 0);
++	if(regs)
++	{
++		info->fix.mmio_start = regs->start;
++		info->fix.mmio_len = regs->end - regs->start + 1;
++		
++		if(!request_mem_region(info->fix.mmio_start, info->fix.mmio_len, AXENT_LEDFB_DRIVER_NAME ".regs"))
++		{
++			dev_err(device, "request for framebuffer register memory failed\n");
++			ret = -EBUSY;
++			goto error_request_regs;
++		}
++		sinfo->regs = ioremap_nocache(info->fix.mmio_start, info->fix.mmio_len);
++		if(!sinfo->regs)
++		{
++			dev_err(device, "unable to map framebuffer register memory\n");
++			ret = -ENOMEM;
++			goto error_ioremap_regs;
++		}
++	}
++	else
++	{
++		dev_err(device, "no resource found for framebuffer register memory\n");
++		ret = -EINVAL;
++		goto error_no_regs;
++	}
++	
++	// Request and map device framebuffer memory
++	frame = platform_get_resource(dev, IORESOURCE_MEM, 1);
++	if(frame)
++	{
++		info->fix.smem_start = frame->start;
++		info->fix.smem_len = frame->end - frame->start + 1;
++		if(!request_mem_region(info->fix.smem_start, info->fix.smem_len, AXENT_LEDFB_DRIVER_NAME ".frame"))
++		{
++			dev_err(device, "request for framebuffer frame memory failed\n");
++			ret = -EBUSY;
++			goto error_request_frame;
++		}
++		
++		info->screen_size = info->fix.smem_len;
++		info->screen_base = ioremap(info->fix.smem_start, info->fix.smem_len);
++		if(!info->screen_base)
++		{
++			dev_err(device, "unable to map framebuffer frame memory\n");
++			ret = -ENOMEM;
++			goto error_ioremap_frame;
++		}
++	}
++	else
++	{
++		dev_err(device, "no resource found for framebuffer frame memory\n");
++		ret = -EINVAL;
++		goto error_no_frame;
++	}
++	
++	dev_info(device,
++			"%luKiB frame buffer at %08lx (mapped at %p)\n",
++			(unsigned long)info->fix.smem_len / 1024,
++			(unsigned long)info->fix.smem_start,
++			info->screen_base);
++	
++	// Request and map device pixel map memory
++	map = platform_get_resource(dev, IORESOURCE_MEM, 2);
++	if(map)
++	{
++		if(!request_mem_region(map->start, map->end - map->start + 1, AXENT_LEDFB_DRIVER_NAME ".pixmap"))
++		{
++			dev_err(device, "request for framebuffer pixel map memory failed\n");
++			ret = -EBUSY;
++			goto error_request_map;
++		}
++		sinfo->map = ioremap(map->start, map->end - map->start + 1);
++		if(!sinfo->map)
++		{
++			dev_err(device, "unable to map framebuffer pixel map memory\n");
++			ret = -ENOMEM;
++			goto error_ioremap_map;
++		}
++		
++		// Store size of pixel map in par
++		sinfo->map_len = map->end - map->start + 1;
++	}
++	else
++	{
++		dev_err(device, "no resource found for framebuffer pixel map memory\n");
++		ret = -EINVAL;
++		goto error_no_map;
++	}
++	
++	dev_info(device,
++			"%luKiB pixel map at %08lx (mapped at %p)\n",
++			(unsigned long)(map->end - map->start + 1) / 1024,
++			(unsigned long)map->start,
++			sinfo->map);
++	
++	// Request and remap CLUT memory
++	clut = platform_get_resource(dev, IORESOURCE_MEM, 3);
++	if(clut)
++	{
++		if(!request_mem_region(clut->start, clut->end - clut->start + 1, AXENT_LEDFB_DRIVER_NAME ".clut"))
++		{
++			dev_err(device, "request for CLUT memory failed\n");
++			ret = -EBUSY;
++			goto error_request_clut;
++		}
++		sinfo->clut = ioremap_nocache(clut->start, clut->end - clut->start + 1);
++		if(!sinfo->clut)
++		{
++			dev_err(device, "unable to map CLUT memory\n");
++			ret = -ENOMEM;
++			goto error_ioremap_clut;
++		}
++		
++		// Store size of clut in par
++		sinfo->clut_len = clut->end - clut->start + 1;
++	}
++	else
++	{
++		dev_err(device, "no resource found for CLUT memory\n");
++		ret = -EINVAL;
++		goto error_no_clut;
++	}
++	
++	dev_info(device,
++			"%luKiB CLUT at %08lx (mapped at %p)\n",
++			(unsigned long)(clut->end - clut->start + 1) / 1024,
++			(unsigned long)clut->start,
++			sinfo->clut);
++	
++	// Associate this fb_info struct with the framebuffer device
++	platform_set_drvdata(dev, info);
++	
++	ret = register_framebuffer(info);
++	if (ret < 0)
++	{
++		dev_err(device, "failed to register framebuffer device: %d\n", ret);
++		goto error_register;
++	}
++	
++	// Don't power up screen here, this will be done in set_par
++	
++	dev_info(device, "fb%d: Axent LEDFB at 0x%08lx (mapped at %p)\n",
++			info->node, info->fix.mmio_start, sinfo->regs);
++	
++    ret = device_create_file(device, &dev_attr_command);
++    if(ret)
++    {
++		dev_err(device, "error %d adding sysfs entry command\n", ret);
++		goto error_device_create_file_1;
++	}
++    
++    ret = device_create_file(device, &dev_attr_config);
++	if(ret)
++	{
++		dev_err(device, "error %d adding sysfs entry config\n", ret);
++		goto error_device_create_file_2;
++	}
++
++	return 0;
++	
++error_device_create_file_2:
++    device_remove_file(device, &dev_attr_command);
++error_device_create_file_1:
++error_register:
++	platform_set_drvdata(dev, NULL);
++	iounmap(sinfo->clut);
++error_ioremap_clut:
++	release_mem_region(clut->start, clut->end - clut->start + 1);
++error_request_clut:
++error_no_clut:
++	iounmap(sinfo->map);
++error_ioremap_map:
++	release_mem_region(map->start, map->end - map->start + 1);
++error_request_map:
++error_no_map:
++	iounmap(info->screen_base);
++error_ioremap_frame:
++	release_mem_region(info->fix.smem_start, info->fix.smem_len);
++error_request_frame:
++error_no_frame:
++	iounmap(sinfo->regs);
++error_ioremap_regs:
++	release_mem_region(info->fix.mmio_start, info->fix.mmio_len);
++error_request_regs:
++error_no_regs:
++error_resources:
++	fb_dealloc_cmap(&info->cmap);
++error_alloc_cmap:
++	framebuffer_release(info);
++error_alloc:
++	return ret;
++}
++
++static int axent_ledfb_remove(struct platform_device *dev)
++{
++	struct fb_info *info = platform_get_drvdata(dev);
++	struct axent_ledfb_info *sinfo = info->par;
++	struct resource *map, *clut;
++	
++	map = platform_get_resource(dev, IORESOURCE_MEM, 2);
++	clut = platform_get_resource(dev, IORESOURCE_MEM, 3);
++	
++	if (info)
++	{
++		unregister_framebuffer(info);
++		iounmap(sinfo->clut);
++		release_mem_region(clut->start, clut->end - clut->start + 1);
++		iounmap(sinfo->map);
++		release_mem_region(map->start, map->end - map->start + 1);
++		iounmap(info->screen_base);
++		release_mem_region(info->fix.smem_start, info->fix.smem_len);
++		iounmap(sinfo->regs);
++		release_mem_region(info->fix.mmio_start, info->fix.mmio_len);
++		fb_dealloc_cmap(&info->cmap);
++		framebuffer_release(info);
++	}
++	
++	return 0;
++}
++
++/* Match table for of_platform binding */
++static struct of_device_id axent_fpga_of_match[] = {
++	{ .compatible = "axent,ledfb", },
++	{}
++};
++MODULE_DEVICE_TABLE(of, axent_fpga_of_match);
++
++static struct platform_driver axent_ledfb_driver = {
++	.driver = {
++		.name	= AXENT_LEDFB_DRIVER_NAME,
++		.owner	= THIS_MODULE,
++		.of_match_table = axent_fpga_of_match,
++	},
++	.probe		= axent_ledfb_probe,
++	.remove		= axent_ledfb_remove,
++};
++
++module_platform_driver(axent_ledfb_driver);
++
++MODULE_DESCRIPTION("Axent LED Display Controller framebuffer driver");
++MODULE_AUTHOR("Daniel Dyer <daniel_dyer@axent.com.au>");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/video/axent_ledmon.c b/drivers/video/axent_ledmon.c
+new file mode 100644
+index 0000000..739c20f
+--- /dev/null
++++ b/drivers/video/axent_ledmon.c
+@@ -0,0 +1,261 @@
++/*
++ *	Driver for Axent LED Display Monitor
++ *
++ *	(C) Copyright 2011-2014 Axent Global
++ *
++ *	By Daniel Dyer, Axent Global, daniel_dyer@axent.com.au.
++ */
++
++#include <linux/platform_device.h>
++#include <linux/kernel.h>
++#include <linux/interrupt.h>
++#include <linux/clk.h>
++#include <linux/init.h>
++#include <linux/delay.h>
++#include <linux/module.h>
++#include <linux/errno.h>
++#include <linux/string.h>
++#include <linux/ioport.h>
++#include <linux/mm.h>
++#include <linux/slab.h>
++#include <linux/log2.h>
++#include <linux/of.h>
++
++#include <asm/uaccess.h>
++#include <asm/io.h>
++#include <asm/byteorder.h>
++
++#include <video/axent_ledmon.h>
++
++#define AXENT_LEDMON_DRIVER_NAME	"axent_ledmon"
++
++static ssize_t axent_ledmon_get_temp_flag(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	struct axent_ledmon_priv *priv = dev_get_drvdata(dev);
++
++	if(ioread32(priv->regs + AXENT_LEDMON_ERRFLAG) & AXENT_LEDMON_TEMP)
++	    return sprintf(buf, "%d\n", 1);
++    else
++        return sprintf(buf, "%d\n", 0);
++}
++
++static ssize_t axent_ledmon_get_oe_flag(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	struct axent_ledmon_priv *priv = dev_get_drvdata(dev);
++
++	if(ioread32(priv->regs + AXENT_LEDMON_ERRFLAG) & AXENT_LEDMON_NOOE)
++	    return sprintf(buf, "%d\n", 1);
++    else
++        return sprintf(buf, "%d\n", 0);
++}
++
++static ssize_t axent_ledmon_get_lat_flag(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	struct axent_ledmon_priv *priv = dev_get_drvdata(dev);
++
++	if(ioread32(priv->regs + AXENT_LEDMON_ERRFLAG) & AXENT_LEDMON_NOLAT)
++	    return sprintf(buf, "%d\n", 1);
++    else
++        return sprintf(buf, "%d\n", 0);
++}
++
++static ssize_t axent_ledmon_get_clk_flag(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	struct axent_ledmon_priv *priv = dev_get_drvdata(dev);
++
++	if(ioread32(priv->regs + AXENT_LEDMON_ERRFLAG) & AXENT_LEDMON_NOCLK)
++	    return sprintf(buf, "%d\n", 1);
++    else
++        return sprintf(buf, "%d\n", 0);
++}
++
++static ssize_t axent_ledmon_get_visible_errors(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	struct axent_ledmon_priv *priv = dev_get_drvdata(dev);
++	int cfg;
++
++	cfg = ioread32(priv->regs + AXENT_LEDMON_VISERR) & 0x3fff;
++
++	return sprintf(buf, "%d\n", cfg);
++}
++
++static ssize_t axent_ledmon_get_open_errors(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	struct axent_ledmon_priv *priv = dev_get_drvdata(dev);
++	int cfg;
++	
++	cfg = ioread32(priv->regs + AXENT_LEDMON_OERR) & 0x3fff;
++	
++	return sprintf(buf, "%d\n", cfg);
++}
++
++static ssize_t axent_ledmon_get_short_errors(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	struct axent_ledmon_priv *priv = dev_get_drvdata(dev);
++	int cfg;
++	
++	cfg = ioread32(priv->regs + AXENT_LEDMON_CERR) & 0x3fff;
++	
++	return sprintf(buf, "%d\n", cfg);
++}
++
++static DEVICE_ATTR(temp_err, 0444, axent_ledmon_get_temp_flag, NULL);
++static DEVICE_ATTR(oe_err, 0444, axent_ledmon_get_oe_flag, NULL);
++static DEVICE_ATTR(lat_err, 0444, axent_ledmon_get_lat_flag, NULL);
++static DEVICE_ATTR(clk_err, 0444, axent_ledmon_get_clk_flag, NULL);
++static DEVICE_ATTR(visible_errors, 0444, axent_ledmon_get_visible_errors, NULL);
++static DEVICE_ATTR(open_errors, 0444, axent_ledmon_get_open_errors, NULL);
++static DEVICE_ATTR(short_errors, 0444, axent_ledmon_get_short_errors, NULL);
++
++static int axent_ledmon_probe(struct platform_device *dev)
++{
++	struct device *device = &dev->dev;
++	struct axent_ledmon_priv *priv;
++	struct resource *regs;
++	int ret;
++	
++	// Allocate device private data
++	priv = kzalloc(sizeof *priv, GFP_KERNEL);
++	if(!priv)
++	{
++		dev_err(device, "unable to allocate private data\n");
++		ret = -ENOMEM;
++		goto error_priv_alloc;
++	}
++	
++	// Associate private data
++	dev_set_drvdata(device, priv);
++	
++	// Check to make sure the device has the required number of resources
++	// TODO: Add support for an IRQ which could do something like hardware test modes (on boards which have the rotary switch wired to the FPGA)
++	if(dev->num_resources < 3)
++	{
++		dev_err(device, "ledmon device has incorrect number of resources\n");
++		ret = -EINVAL;
++		goto error_resources;
++	}
++	
++	// Request and map device register memory
++	regs = platform_get_resource(dev, IORESOURCE_MEM, 0);
++	if(regs)
++	{
++		if(!request_mem_region(regs->start, regs->end - regs->start + 1, AXENT_LEDMON_DRIVER_NAME ".regs"))
++		{
++			dev_err(device, "request for register memory failed\n");
++			ret = -EBUSY;
++			goto error_request_regs;
++		}
++		priv->regs = ioremap_nocache(regs->start, regs->end - regs->start + 1);
++		if(!priv->regs)
++		{
++			dev_err(device, "unable to map register memory\n");
++			ret = -ENOMEM;
++			goto error_ioremap_regs;
++		}
++	}
++	else
++	{
++		dev_err(device, "no resource found for register memory\n");
++		ret = -EINVAL;
++		goto error_no_regs;
++	}
++	
++	dev_info(device, "Axent LED Monitor Controller at 0x%08lx (mapped at %p)\n",
++			 (unsigned long)regs->start, priv->regs);
++	
++	ret = device_create_file(device, &dev_attr_temp_err);
++	if(ret)
++	{
++		dev_err(device, "error %d adding sysfs entry temp_err\n", ret);
++		goto error_device_create_file_1;
++	}
++	
++	ret = device_create_file(device, &dev_attr_oe_err);
++	if(ret)
++	{
++		dev_err(device, "error %d adding sysfs entry oe_err\n", ret);
++		goto error_device_create_file_2;
++	}
++	
++	ret = device_create_file(device, &dev_attr_lat_err);
++	if(ret)
++	{
++		dev_err(device, "error %d adding sysfs entry lat_err\n", ret);
++		goto error_device_create_file_3;
++	}
++	
++	ret = device_create_file(device, &dev_attr_clk_err);
++	if(ret)
++	{
++		dev_err(device, "error %d adding sysfs entry clk_err\n", ret);
++		goto error_device_create_file_4;
++	}
++	
++	ret = device_create_file(device, &dev_attr_visible_errors);
++	if(ret)
++	{
++		dev_err(device, "error %d adding sysfs entry visible_errors\n", ret);
++		goto error_device_create_file_5;
++	}
++	
++	ret = device_create_file(device, &dev_attr_open_errors);
++	if(ret)
++	{
++		dev_err(device, "error %d adding sysfs entry open_errors\n", ret);
++		goto error_device_create_file_6;
++	}
++	
++    ret = device_create_file(device, &dev_attr_short_errors);
++	if(ret)
++	{
++		dev_err(device, "error %d adding sysfs entry short_errors\n", ret);
++		goto error_device_create_file_7;
++	}
++
++	return 0;
++	
++error_device_create_file_7:
++	device_remove_file(device, &dev_attr_open_errors);
++error_device_create_file_6:
++	device_remove_file(device, &dev_attr_visible_errors);
++error_device_create_file_5:
++	device_remove_file(device, &dev_attr_clk_err);
++error_device_create_file_4:
++	device_remove_file(device, &dev_attr_lat_err);
++error_device_create_file_3:
++	device_remove_file(device, &dev_attr_oe_err);
++error_device_create_file_2:
++	device_remove_file(device, &dev_attr_temp_err);
++error_device_create_file_1:
++	iounmap(priv->regs);
++error_ioremap_regs:
++	release_mem_region(regs->start, regs->end - regs->start + 1);
++error_request_regs:
++error_no_regs:
++error_resources:
++	dev_set_drvdata(device, NULL);
++error_priv_alloc:
++	return ret;
++}
++
++/* Match table for of_platform binding */
++static struct of_device_id axent_fpga_of_match[] = {
++	{ .compatible = "axent,ledmon", },
++	{}
++};
++MODULE_DEVICE_TABLE(of, axent_fpga_of_match);
++
++static struct platform_driver axent_ledmon_driver = {
++	.driver = {
++		.name	= AXENT_LEDMON_DRIVER_NAME,
++		.owner	= THIS_MODULE,
++		.of_match_table = axent_fpga_of_match,
++	},
++	.probe		= axent_ledmon_probe,
++};
++
++module_platform_driver(axent_ledmon_driver);
++
++MODULE_DESCRIPTION("Axent LED Display Monitor driver");
++MODULE_AUTHOR("Daniel Dyer <daniel_dyer@axent.com.au>");
++MODULE_LICENSE("GPL");
+diff --git a/include/video/axent_ledfb.h b/include/video/axent_ledfb.h
+new file mode 100644
+index 0000000..e3b3c81
+--- /dev/null
++++ b/include/video/axent_ledfb.h
+@@ -0,0 +1,128 @@
++/*
++ *  Header file for Axent LED Display Controller
++ *
++ *  Data structure and register user interface
++ *
++ *  (C) Copyright 2011 Axent Global
++ *
++ *  By Daniel Dyer, Axent Global, daniel_dyer@axent.com.au.
++ */
++#ifndef __AXENT_LEDFB_H__
++#define __AXENT_LEDFB_H__
++
++// Register definitions
++#define AXENT_LEDFB_CR		0x00			// Command register
++#define		AXENT_LEDFB_START	(1 << 0)	// Display state machine restart/stop
++#define		AXENT_LEDFB_UNBLANK	(1 << 1)	// Display OE disable (blank)
++#define		AXENT_LEDFB_CMD	(1 << 2)		// Command begin
++
++#define AXENT_LEDFB_I		0x04			// Interrupt register
++#define		AXENT_LEDFB_IACK	(1 << 0)	// Interrupt acknowledge
++
++#define AXENT_LEDFB_BR		0x08		// Brightness register
++#define AXENT_LEDFB_SCAN	0x0c		// Scan lines select
++#define AXENT_LEDFB_PX		0x10		// Pixels per channel select
++#define AXENT_LEDFB_PXMAX	0x14		// Maximum channel pixels
++#define AXENT_LEDFB_CH		0x18		// Number of channels
++#define AXENT_LEDFB_OEDIV	0x1c		// System clock divider for output enable
++#define AXENT_LEDFB_CDEPTH	0x20		// Bit depth per colour
++#define AXENT_LEDFB_COFF	0x24		// Pixel channel RAM offset
++#define AXENT_LEDFB_CFG		0x28		// Config data register
++#define AXENT_LEDFB_CMDMODE	0x2c		// Command mode register
++#define AXENT_LEDFB_CMDSCAN	0x30		// Scan line select for command
++#define AXENT_LEDFB_ERRFLAG	0x34		// Error flags register
++#define		AXENT_LEDFB_NOCLK	(1 << 0)
++#define		AXENT_LEDFB_NOLAT	(1 << 1)
++#define		AXENT_LEDFB_NOOE	(1 << 2)
++#define		AXENT_LEDFB_TEMP	(1 << 3)
++#define AXENT_LEDFB_VISERR	0x38		// Visible error count register
++#define AXENT_LEDFB_OERR	0x3c		// Open-circuit error count register
++#define AXENT_LEDFB_CERR	0x40		// Short-circuit error count register
++
++// Command definitions
++#define AXENT_LEDFB_CMD_OPEN		0x01
++#define AXENT_LEDFB_CMD_SHORT 		0x02
++#define AXENT_LEDFB_CMD_THERMAL		0x03
++#define AXENT_LEDFB_CMD_WRITECFG	0x04
++
++// IOCTL assignments
++#define AXENT_LEDFB_IOCTL_MAGIC	'x'
++
++#define AXENT_LEDFB_IOCTL_SET_MODULE_INFO		_IOW(AXENT_LEDFB_IOCTL_MAGIC, 0, struct led_module_info_user)
++#define AXENT_LEDFB_IOCTL_SET_MODULE_PATTERN	_IOW(AXENT_LEDFB_IOCTL_MAGIC, 1, struct led_module_pattern)
++#define AXENT_LEDFB_IOCTL_ADD_MODULE			_IOW(AXENT_LEDFB_IOCTL_MAGIC, 2, struct led_module_user)
++#define AXENT_LEDFB_IOCTL_RESET_MODULE_LIST		_IO(AXENT_LEDFB_IOCTL_MAGIC, 3)
++#define AXENT_LEDFB_IOCTL_SET_BRIGHTNESS		_IOW(AXENT_LEDFB_IOCTL_MAGIC, 4, int)
++#define AXENT_LEDFB_IOCTL_GET_BRIGHTNESS		_IOR(AXENT_LEDFB_IOCTL_MAGIC, 5, int)
++#define AXENT_LEDFB_IOCTL_SET_OEFREQ			_IOW(AXENT_LEDFB_IOCTL_MAGIC, 6, int)
++#define AXENT_LEDFB_IOCTL_SET_COLOURS           _IOW(AXENT_LEDFB_IOCTL_MAGIC, 7, int)
++#define AXENT_LEDFB_IOCTL_SET_CONFIGURATION		_IOW(AXENT_LEDFB_IOCTL_MAGIC, 8, int)
++#define AXENT_LEDFB_IOCTL_GET_ERROR_DATA		_IOR(AXENT_LEDFB_IOCTL_MAGIC, 9, struct led_error_data)
++#define AXENT_LEDFB_IOCTL_REQUEST_ERROR_DATA	_IO(AXENT_LEDFB_IOCTL_MAGIC, 10)
++
++// Struct which contains data from the error detector module
++struct led_error_data {
++	__u8 clk_err;
++	__u8 lat_err;
++	__u8 oe_err;
++	__u8 temp_flag;
++	__u16 visible_errors;
++	__u16 open_errors;
++	__u16 short_errors;
++};
++
++// Struct which contains information about the module clocking pattern
++struct led_module_pattern {
++	__u8 channel;			// Stores the channel this pattern refers to
++	__u16 pattern[511];		// Stores the actual pattern data
++};
++
++// Struct which contains information about the module type from the user
++struct led_module_info_user {
++	__u8 res_x;				// Module x-resolution (in pixels)
++	__u8 res_y;				// Module y-resolution (in pixels)
++	__u8 channels;			// Number of RGB channels for the module
++	__u8 scan_lines;		// Number of scan lines for the module
++};
++
++// Struct which contains information about the module type driven by this device
++struct led_module_info {
++	__u8 res_x;				// Module x-resolution (in pixels)
++	__u8 res_y;				// Module y-resolution (in pixels)
++	__u8 channels;			// Number of RGB channels for the module
++	__u8 scan_lines;		// Number of scan lines for the module
++	__u16 pattern[8][511];	// Clocking patterns for the module
++};
++
++// Struct which contains module data from the user
++struct led_module_user {
++	__u8 superchannel;		// Which superchannel (ie. physical connector) is this module connected to?
++	__u8 index;				// Position along the chain (starting at 0)
++	__u16 pos_x;			// X-position within the confines of the display resolution (in pixels)
++	__u16 pos_y;			// Y-position within the confines of the display resolution (in pixels)
++};
++
++// Struct which contains information about the connection and placement of each individual module.
++struct led_module {
++	struct list_head list;  
++	__u8 superchannel;		// Which superchannel (ie. physical connector) is this module connected to? (starting at 0)
++	__u8 index;				// Position along the chain (starting at 0)
++	__u16 pos_x;			// X-position within the confines of the display resolution (in pixels)
++	__u16 pos_y;			// Y-position within the confines of the display resolution (in pixels)
++};
++
++// LEDFB controller info data structure, stored in device platform_data
++struct axent_ledfb_info {
++	void __iomem *regs;
++	void __iomem *map;
++	void __iomem *clut;
++	size_t map_len;
++	size_t clut_len;
++	u32 pixels_per_channel;
++	u8 superchannel_index_max[256];
++	struct led_module_info module_info;
++	struct list_head module_list;
++	u32 pseudo_palette[16];
++};
++
++#endif /* __AXENT_LEDFB_H__ */
+diff --git a/include/video/axent_ledmon.h b/include/video/axent_ledmon.h
+new file mode 100644
+index 0000000..6d1d73d
+--- /dev/null
++++ b/include/video/axent_ledmon.h
+@@ -0,0 +1,44 @@
++/*
++ *  Header file for Axent LED Display Monitor
++ *
++ *  Data structure and register user interface
++ *
++ *  (C) Copyright 2011-2014 Axent Global
++ *
++ *  By Daniel Dyer, Axent Global, daniel_dyer@axent.com.au.
++ */
++#ifndef __AXENT_LEDMON_H__
++#define __AXENT_LEDMON_H__
++
++// Register definitions
++#define AXENT_LEDMON_SCAN	0x00		// Scan lines select
++#define AXENT_LEDMON_PXMAX	0x04		// Maximum channel pixels
++#define AXENT_LEDMON_GRP	0x08		// Number of groups
++#define AXENT_LEDMON_CH		0x0c		// Number of channels per group
++#define AXENT_LEDMON_COFF	0x10		// Pixel channel RAM offset
++#define AXENT_LEDMON_OERR	0x14		// Open-circuit error count register
++#define AXENT_LEDMON_CERR	0x18		// Short-circuit error count register
++#define AXENT_LEDMON_VISERR	0x1c		// Visible error count register
++#define AXENT_LEDMON_ERRFLAG	0x20	// Error flags register
++#define		AXENT_LEDMON_TEMP	(1 << 0)
++#define		AXENT_LEDMON_NOCLK	(1 << 1)
++#define		AXENT_LEDMON_NOLAT	(1 << 2)
++#define		AXENT_LEDMON_NOOE	(1 << 3)
++
++// Struct which contains data from the error detector module
++struct led_error_data {
++	__u8 clk_err;
++	__u8 lat_err;
++	__u8 oe_err;
++	__u8 temp_flag;
++	__u16 visible_errors;
++	__u16 open_errors;
++	__u16 short_errors;
++};
++
++// LEDMON controller private info data structure
++struct axent_ledmon_priv {
++	void __iomem *regs;
++};
++
++#endif /* __AXENT_LEDMON_H__ */

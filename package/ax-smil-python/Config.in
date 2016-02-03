@@ -1,0 +1,7 @@
+config BR2_PACKAGE_AX_SMIL_PYTHON
+	bool "ax-smil-python"
+	depends on BR2_PACKAGE_PYTHON && BR2_PACKAGE_PYCAIRO && BR2_PACKAGE_PIL
+	help
+	  ax-smil is a SMIL 3.0 player written in Python.
+
+	  https://bitbucket.org/axent/axent_smil

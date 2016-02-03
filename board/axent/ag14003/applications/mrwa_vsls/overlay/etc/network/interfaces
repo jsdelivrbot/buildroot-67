@@ -1,0 +1,35 @@
+# Configure Loopback
+auto lo
+iface lo inet loopback
+
+auto br0
+iface br0 inet static
+	pre-up brctl addbr br0
+	address 192.168.0.10
+	netmask 255.255.255.0
+	gateway 192.168.0.1
+	post-down brctl delbr br0
+
+auto eth0
+iface eth0 inet manual
+	up ip link set eth0 up
+	up brctl addif br0 eth0
+	down brctl delif br0 eth0 || true
+	down ip link set eth0 down
+
+auto eth1
+iface eth1 inet manual
+	up ip link set eth1 up
+	up brctl addif br0 eth1
+	down brctl delif br0 eth1 || true
+	down ip link set eth1 down
+
+iface wwan0 inet manual
+	up /usr/share/setup_chat.sh wwan0
+	up /usr/sbin/chat -t10 -f /etc/gsm/mc879x > /dev/ttyUSB3 < /dev/ttyUSB3
+	up ifconfig wwan0 up
+	up udhcpc -i wwan0 -q -t 6 -n -p /var/run/udhcpc.wwan0.pid &
+	up /usr/share/gprs_monitor.sh wwan0 ttyUSB3 &
+	down kill `cat /var/run/gprs_monitor.wwan0.pid 2>/dev/null` 2>/dev/null
+	down kill `cat /var/run/udhcpc.wwan0.pid 2>/dev/null` 2>/dev/null
+	down ifconfig wwan0 down

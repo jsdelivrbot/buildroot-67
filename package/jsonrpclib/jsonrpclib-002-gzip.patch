@@ -1,0 +1,27 @@
+diff --git a/jsonrpclib/SimpleJSONRPCServer.py b/jsonrpclib/SimpleJSONRPCServer.py
+index d76da73..4d26e53 100644
+--- a/jsonrpclib/SimpleJSONRPCServer.py
++++ b/jsonrpclib/SimpleJSONRPCServer.py
+@@ -3,6 +3,7 @@ from jsonrpclib import Fault
+ from jsonrpclib.jsonrpc import USE_UNIX_SOCKETS
+ import SimpleXMLRPCServer
+ import SocketServer
++import xmlrpclib
+ import socket
+ import logging
+ import os
+@@ -175,6 +176,14 @@ class SimpleJSONRPCRequestHandler(
+         if response == None:
+             response = ''
+         self.send_header("Content-type", "application/json-rpc")
++        if len(response) > 250:
++            q = self.accept_encodings().get("gzip", 0)
++            if q:
++                try:
++                    response = xmlrpclib.gzip_encode(response)
++                    self.send_header("Content-Encoding", "gzip")
++                except NotImplementedError:
++                    pass
+         self.send_header("Content-length", str(len(response)))
+         self.end_headers()
+         self.wfile.write(response)

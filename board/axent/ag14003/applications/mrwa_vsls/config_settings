@@ -1,0 +1,138 @@
+INSERT OR REPLACE INTO clock (deviceName, frequency) VALUES ("fclk1", "1000000");
+INSERT OR REPLACE INTO display (deviceName, displayID, moduleID, greyDepth)
+    VALUES ("4aa00000.axent_ledfb", "24", "24", "4");
+INSERT OR REPLACE INTO display (deviceName, displayID, moduleID, greyDepth)
+    VALUES ("4aa40000.axent_ledfb", "23", "23", "4");
+
+INSERT OR REPLACE INTO alarm (parameter, upperLimit, lowerLimit)
+    VALUES ("batteryLow", "", "12.5");
+INSERT OR REPLACE INTO alarm (parameter, upperLimit, lowerLimit, critical)
+    VALUES ("batteryCritical", "", "12", "yes");
+INSERT OR REPLACE INTO alarm (parameter, upperLimit, lowerLimit)
+    VALUES ("mainsFailed", "1", "");
+INSERT OR REPLACE INTO alarm (parameter, upperLimit, lowerLimit)
+    VALUES ("signCommsTimeout", "10", "");
+INSERT OR REPLACE INTO alarm (parameter, upperLimit, lowerLimit, critical)
+    VALUES ("masterCommsTimeout", "10", "", "yes");
+INSERT OR REPLACE INTO alarm (parameter, upperLimit, lowerLimit)
+    VALUES ("signTilt", "15", "");
+INSERT OR REPLACE INTO alarm (parameter, upperLimit, lowerLimit)
+    VALUES ("solarSystem", "1", "");
+
+INSERT OR REPLACE INTO alarm (parameter, upperLimit, lowerLimit, critical)
+    VALUES ("displayDriverFailure", "1", "", "yes");
+INSERT OR REPLACE INTO alarm (parameter, upperLimit, lowerLimit)
+    VALUES ("displaySingleLEDFailure", "1", "");
+INSERT OR REPLACE INTO alarm (parameter, upperLimit, lowerLimit, critical)
+    VALUES ("displayMultiLEDFailure", "30", "", "yes");    
+INSERT OR REPLACE INTO alarm (parameter, upperLimit, lowerLimit, critical)
+    VALUES ("annulusLEDFailure", "15", "", "yes");
+
+INSERT OR REPLACE INTO system (parameter, value)
+    VALUES ("masterAddress", "localhost");
+INSERT OR REPLACE INTO system (parameter, value)
+    VALUES ("signID", "1");
+INSERT OR REPLACE INTO system (parameter, value)
+    VALUES ("signEnabled", "yes");
+INSERT OR REPLACE INTO system (parameter, value)
+    VALUES ("siteID", "1");
+INSERT OR REPLACE INTO system (parameter, value)
+    VALUES ("signCheckInterval", "5");
+INSERT OR REPLACE INTO system (parameter, value)
+    VALUES ("statusCheckInterval", "10");
+INSERT OR REPLACE INTO system (parameter, value)
+    VALUES ("statusLogInterval", "300");
+INSERT OR REPLACE INTO system (parameter, value)
+    VALUES ("rtaProtocolEnabled", "yes");
+INSERT OR REPLACE INTO system (parameter, value)
+    VALUES ("rtaPort", "43000");
+INSERT OR REPLACE INTO system (parameter, value)
+    VALUES ("rtaPasswordOffset", "a410");
+INSERT OR REPLACE INTO system (parameter, value)
+    VALUES ("rtaPasswordSeedOffset", "2a");
+INSERT OR REPLACE INTO system (parameter, value)
+    VALUES ("rtaSessionTimeout", "120");    
+INSERT OR REPLACE INTO system (parameter, value)
+    VALUES ("rtaDisplayTimeout", "0");
+INSERT OR REPLACE INTO system (parameter, value)
+    VALUES ("rtaControllerAddress", "1");
+INSERT OR REPLACE INTO system (parameter, value)
+    VALUES ("ucaAddress", "192.168.0.1");
+INSERT OR REPLACE INTO system (parameter, value)
+    VALUES ("ucaPort", "44000");
+INSERT OR REPLACE INTO system (parameter, value)
+    VALUES ("ucaEnabled", "yes");
+INSERT OR REPLACE INTO system (parameter, value)
+    VALUES ("ucaProtocolType", "udp");
+INSERT OR REPLACE INTO system (parameter, value)
+    VALUES ("ucaSendInterval", "600");
+
+CREATE TABLE speeds (
+    frame_id        INTEGER PRIMARY KEY,
+    allowed         TEXT DEFAULT "yes"
+);
+
+INSERT OR REPLACE INTO speeds (frame_id)
+    VALUES ("10");
+INSERT OR REPLACE INTO speeds (frame_id)
+    VALUES ("20");
+INSERT OR REPLACE INTO speeds (frame_id)
+    VALUES ("25");
+INSERT OR REPLACE INTO speeds (frame_id)
+    VALUES ("30");
+INSERT OR REPLACE INTO speeds (frame_id)
+    VALUES ("40");
+INSERT OR REPLACE INTO speeds (frame_id)
+    VALUES ("50");    
+INSERT OR REPLACE INTO speeds (frame_id)
+    VALUES ("60");
+INSERT OR REPLACE INTO speeds (frame_id)
+    VALUES ("70");
+INSERT OR REPLACE INTO speeds (frame_id)
+    VALUES ("80");    
+INSERT OR REPLACE INTO speeds (frame_id)
+    VALUES ("90");
+INSERT OR REPLACE INTO speeds (frame_id)
+    VALUES ("100");
+INSERT OR REPLACE INTO speeds (frame_id)
+    VALUES ("110");    
+    
+CREATE TABLE signs (
+    sign_id         INTEGER PRIMARY KEY,
+    unique_id       TEXT,
+    address         TEXT,
+    xbeeSerial      TEXT,
+    brightness      INTEGER     DEFAULT 8,
+    brightness_mode TEXT        DEFAULT "auto",
+    test_mode       INTEGER     DEFAULT 0,
+    enabled         TEXT        DEFAULT "yes"
+);
+
+INSERT OR REPLACE INTO signs (sign_id, address)
+    VALUES (1, "localhost");
+
+CREATE TABLE modem (
+    interface           TEXT    PRIMARY KEY,
+    auth_mode           TEXT    DEFAULT "none",
+    auth_user           TEXT,
+    auth_pass           TEXT,
+    watchdog_enabled    TEXT    DEFAULT "no",
+    watchdog_ip         TEXT    DEFAULT "0.0.0.0",
+    apn                 TEXT    DEFAULT "axent.au"
+);
+
+INSERT OR REPLACE INTO modem (interface) VALUES ("wwan0");
+
+CREATE TABLE serialport (
+    name            TEXT PRIMARY KEY,
+    device          TEXT,
+    protocol        TEXT,
+    baudRate        INTEGER DEFAULT 115200,
+    parity          TEXT DEFAULT "none",
+    stopBits        INTEGER DEFAULT 1,
+    flowControl     TEXT DEFAULT "none",
+    enabled         TEXT DEFAULT "no"
+);
+
+INSERT OR REPLACE INTO serialport (name, device, protocol, baudrate, enabled)
+    VALUES ("xbee", "/dev/ttyS0", "mrwa", 115200, "yes");

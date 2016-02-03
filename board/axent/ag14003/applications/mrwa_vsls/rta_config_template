@@ -1,0 +1,34 @@
+CREATE TABLE plan (
+    uniqueID    INTEGER PRIMARY KEY,
+    revision    INTEGER DEFAULT 0,
+    type        INTEGER,
+    enable      INTEGER DEFAULT 0
+);
+
+CREATE TABLE plan_weekly (
+    planID      INTEGER PRIMARY KEY,
+    data        INTEGER
+);
+
+CREATE TABLE plan_monthly (
+    planID      INTEGER PRIMARY KEY,
+    year		INTEGER,
+    month       INTEGER,
+    data        INTEGER
+);
+
+CREATE TABLE plan_yearly (
+    planID      INTEGER PRIMARY KEY,
+    year		INTEGER,
+    data        TEXT
+);
+
+CREATE TABLE plan_entry (
+    uniqueID    INTEGER PRIMARY KEY,
+    planID      INTEGER,
+    frameID		INTEGER,
+    startH      INTEGER,
+    startM      INTEGER,
+    endH        INTEGER,
+    endM        INTEGER
+);

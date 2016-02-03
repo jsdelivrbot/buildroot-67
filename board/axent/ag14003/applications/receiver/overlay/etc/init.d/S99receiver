@@ -1,0 +1,10 @@
+#!/bin/sh
+#
+# Startup script for VMS display receiver.
+ 
+# Run display configuration heartbeat.
+ax-display-heartbeat >/dev/null 2>&1 &
+
+# Run JSON server.
+ax-server -c /usr/share/db/config.db -j 42000 >/dev/null 2>&1 &
+

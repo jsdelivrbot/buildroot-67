@@ -1,0 +1,104 @@
+CREATE TABLE limits (
+    entryName       TEXT PRIMARY KEY,
+    entryValue      
+);
+
+INSERT OR REPLACE INTO limits VALUES ('status_log_limit', 100000);
+INSERT OR REPLACE INTO limits VALUES ('status_log_entries', 0);
+
+CREATE TABLE status_log (
+    id                  INTEGER PRIMARY KEY,
+    sign_id             INTEGER,
+    system_time         TEXT,
+    temperature         TEXT,
+    humidity            TEXT,
+    uptime              INTEGER,
+    platform_version    TEXT,
+    application_version TEXT,
+    load_averages       TEXT,
+    ldr                 TEXT,    
+    utc_time            TEXT,
+    enabled             TEXT,
+    battery_voltage     TEXT,
+    battery_current     TEXT,
+    battery_power       TEXT,
+    solar_voltage       TEXT, 
+    solar_current       TEXT,
+    solar_power         TEXT,
+    dc_voltage          TEXT,
+    dc_current          TEXT,
+    dc_power            TEXT,
+    mains_status        TEXT,
+    brightness          INTEGER,
+    brightness_mode     TEXT,
+    test_mode           INTEGER,
+    running             TEXT,
+    document            TEXT,
+    annulus_open        INTEGER,
+    annulus_short       INTEGER,
+    annulus_visible     INTEGER,
+    annulus_driver      INTEGER,
+    matrix_open         INTEGER,
+    matrix_short        INTEGER,
+    matrix_visible      INTEGER,
+    matrix_driver       INTEGER,
+    tilt                INTEGER,
+    date                TEXT
+);
+
+CREATE TRIGGER status_log_entries_limit_trigger BEFORE INSERT ON status_log
+    FOR EACH ROW
+    WHEN (SELECT entryValue FROM limits WHERE entryName = 'status_log_entries')
+      >= (SELECT entryValue FROM limits WHERE entryName = 'status_log_limit')
+    BEGIN
+        DELETE FROM status_log
+            WHERE date = (SELECT date FROM status_log ORDER BY date LIMIT 1);
+    END;
+
+CREATE TRIGGER status_log_entries_count_insert_trigger AFTER INSERT ON status_log
+    FOR EACH ROW
+    BEGIN
+        UPDATE limits SET entryValue = entryValue + 1
+            WHERE entryName = 'status_log_entries';
+    END;
+
+CREATE TRIGGER status_log_entries_count_delete_trigger AFTER DELETE ON status_log
+    FOR EACH ROW
+    BEGIN
+        UPDATE limits SET entryValue = entryValue - 1
+            WHERE entryName = 'status_log_entries';
+    END;
+
+INSERT OR REPLACE INTO limits VALUES ('event_log_limit', 100000);
+INSERT OR REPLACE INTO limits VALUES ('event_log_entries', 0);
+
+CREATE TABLE event_log (
+    id                  INTEGER PRIMARY KEY,
+    sign_id             INTEGER,
+    type                TEXT,
+    event               TEXT,
+    date                TEXT
+);
+
+CREATE TRIGGER event_log_entries_limit_trigger BEFORE INSERT ON event_log
+    FOR EACH ROW
+    WHEN (SELECT entryValue FROM limits WHERE entryName = 'event_log_entries')
+      >= (SELECT entryValue FROM limits WHERE entryName = 'event_log_limit')
+    BEGIN
+        DELETE FROM event_log
+            WHERE date = (SELECT date FROM event_log ORDER BY date LIMIT 1);
+    END;
+
+CREATE TRIGGER event_log_entries_count_insert_trigger AFTER INSERT ON event_log
+    FOR EACH ROW
+    BEGIN
+        UPDATE limits SET entryValue = entryValue + 1
+            WHERE entryName = 'event_log_entries';
+    END;
+
+CREATE TRIGGER event_log_entries_count_delete_trigger AFTER DELETE ON event_log
+    FOR EACH ROW
+    BEGIN
+        UPDATE limits SET entryValue = entryValue - 1
+            WHERE entryName = 'event_log_entries';
+    END;
